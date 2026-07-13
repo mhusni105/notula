@@ -8,6 +8,7 @@ import {
   Mic,
   Square,
   UploadCloud,
+  Upload,
   CheckCircle2,
   XCircle,
   AlertCircle,
@@ -66,6 +67,13 @@ export default function App() {
   const [noteTitle, setNoteTitle] = useState("");
   const [offlineStatus, setOfflineStatus] = useState<string | null>(null);
 
+  // File Upload State
+  const [inputMode, setInputMode] = useState<"record" | "upload">("record");
+  const [uploadedFileBase64, setUploadedFileBase64] = useState<string | null>(null);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
+  const [uploadedFileType, setUploadedFileType] = useState<string | null>(null);
+  const [uploadedFileDuration, setUploadedFileDuration] = useState(0);
+
   // Custom Template Form State
   const [showAddTemplate, setShowAddTemplate] = useState(false);
   const [newTplName, setNewTplName] = useState("");
@@ -78,8 +86,9 @@ export default function App() {
   const [serverLogs, setServerLogs] = useState<ServerLog[]>([]);
   const [gdriveFiles, setGdriveFiles] = useState<VirtualDriveFile[]>([]);
   const [rawDb, setRawDb] = useState<any>(null);
-  const [adminTab, setAdminTab] = useState<"logs" | "gdrive" | "database">("logs");
+  const [adminTab, setAdminTab] = useState<"logs" | "gdrive" | "database" | "provider">("logs");
   const [decryptAdminDb, setDecryptAdminDb] = useState(false);
+  const [adminProviderInfo, setAdminProviderInfo] = useState<any>(null);
 
   // UI status helpers
   const [isUploading, setIsUploading] = useState(false);
@@ -92,6 +101,7 @@ export default function App() {
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const isRecordingRef = useRef(false);
   const logsEndRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Load Initial Data on Login
   useEffect(() => {
@@ -102,6 +112,7 @@ export default function App() {
     fetchAdminLogs();
     fetchAdminGdrive();
     fetchAdminDb();
+    fetchAdminProvider();
 
     // Setup polling for notes status, server logs, and virtual drive
     const interval = setInterval(() => {
@@ -238,6 +249,18 @@ export default function App() {
     }
   };
 
+  const fetchAdminProvider = async () => {
+    try {
+      const res = await fetch("/api/admin/provider");
+      if (res.ok) {
+        const data = await res.json();
+        setAdminProviderInfo(data);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   // Auth Operations
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -367,8 +390,39 @@ export default function App() {
     }
   };
 
+  const handleFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadedFileName(file.name);
+    setUploadedFileType(file.type);
+
+    // Read file as base64
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onloadend = () => {
+      const base64data = reader.result as string;
+      const rawBase64 = base64data.split(",")[1];
+      setUploadedFileBase64(rawBase64);
+    };
+
+    // Try to get audio duration from file metadata
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      file.arrayBuffer().then((buf) => {
+        audioCtx.decodeAudioData(buf).then((audioBuf) => {
+          setUploadedFileDuration(Math.round(audioBuf.duration));
+          audioCtx.close();
+        }).catch(() => { audioCtx.close(); });
+      }).catch(() => { audioCtx.close(); });
+    } catch {}
+
+    setOfflineStatus(`File "${file.name}" berhasil dimuat (${(file.size / 1024).toFixed(1)} KB). Siap diunggah.`);
+  };
+
   const handleUploadAndProcess = async () => {
-    if (!recordedBase64 || !currentUser) return;
+    if (!currentUser) return;
+    const audioBase64 = inputMode === "record" ? recordedBase64 : uploadedFileBase64;
+    if (!audioBase64) return;
     if (!noteTitle.trim()) {
       alert("Harap masukkan judul rapat.");
       return;
@@ -378,16 +432,21 @@ export default function App() {
     setUploadError("");
 
     try {
+      const bodyObj: Record<string, any> = {
+        userId: currentUser.id,
+        title: noteTitle,
+        durationSeconds: inputMode === "record" ? recordingDuration : uploadedFileDuration,
+        audioBase64,
+        templateId: selectedTemplateId,
+      };
+      if (inputMode === "upload" && uploadedFileName) {
+        bodyObj.fileName = uploadedFileName;
+      }
+
       const res = await fetch("/api/notes/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          title: noteTitle,
-          durationSeconds: recordingDuration,
-          audioBase64: recordedBase64,
-          templateId: selectedTemplateId,
-        }),
+        body: JSON.stringify(bodyObj),
       });
 
       const data = await res.json();
@@ -402,6 +461,10 @@ export default function App() {
       setRecordedBlob(null);
       setRecordedBase64(null);
       setRecordingDuration(0);
+      setUploadedFileBase64(null);
+      setUploadedFileName(null);
+      setUploadedFileType(null);
+      setUploadedFileDuration(0);
       setOfflineStatus(null);
       setIsUploading(false);
 
@@ -412,7 +475,6 @@ export default function App() {
       setIsUploading(false);
     }
   };
-
   // Add Custom Template
   const handleAddTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -678,46 +740,139 @@ export default function App() {
                   {/* ACTIVE RECORDR CONTAINER */}
                   <div className="bg-[#18181B] p-4 rounded-sm border border-[#262626] flex flex-col items-center">
                     <h4 className="text-xs font-bold uppercase tracking-wider text-[#A1A1AA] mb-3 self-start">
-                      Mulai Sesi Rekaman Baru
+                      Buat Catatan Baru
                     </h4>
 
-                    {/* Microphone Pulse Animation when recording */}
-                    <div className="relative my-4 flex items-center justify-center">
-                      {isRecording && (
-                        <>
-                          <span className="absolute inline-flex h-24 w-24 rounded-full bg-rose-500 opacity-10 animate-ping pointer-events-none"></span>
-                          <span className="absolute inline-flex h-20 w-20 rounded-full bg-rose-500 opacity-20 animate-pulse pointer-events-none"></span>
-                        </>
-                      )}
+                    {/* Mode Toggle: Record vs Upload */}
+                    <div className="flex w-full mb-3 bg-[#0A0A0B] rounded-sm border border-[#262626] p-0.5">
                       <button
-                        onClick={isRecording ? stopRecording : startRecording}
-                        className={`w-16 h-16 rounded-sm flex items-center justify-center text-white transition-all cursor-pointer ${
-                          isRecording
-                            ? "bg-rose-600 hover:bg-rose-700"
-                            : "bg-indigo-600 hover:bg-indigo-700"
+                        onClick={() => {
+                          setInputMode("record");
+                          setUploadedFileBase64(null);
+                          setUploadedFileName(null);
+                          setUploadedFileType(null);
+                          setUploadedFileDuration(0);
+                          setOfflineStatus(null);
+                        }}
+                        className={`flex-1 text-[10px] font-bold uppercase tracking-wider py-1.5 px-2 rounded-sm transition-all cursor-pointer ${
+                          inputMode === "record"
+                            ? "bg-indigo-600 text-white"
+                            : "text-[#71717A] hover:text-[#E0E0E0]"
                         }`}
                       >
-                        {isRecording ? <Square className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                        <Mic className="w-3 h-3 inline-block mr-1" />
+                        Rekam Audio
+                      </button>
+                      <button
+                        onClick={() => {
+                          setInputMode("upload");
+                          if (isRecording) stopRecording();
+                          setOfflineStatus(null);
+                        }}
+                        className={`flex-1 text-[10px] font-bold uppercase tracking-wider py-1.5 px-2 rounded-sm transition-all cursor-pointer ${
+                          inputMode === "upload"
+                            ? "bg-indigo-600 text-white"
+                            : "text-[#71717A] hover:text-[#E0E0E0]"
+                        }`}
+                      >
+                        <Upload className="w-3 h-3 inline-block mr-1" />
+                        Unggah File
                       </button>
                     </div>
 
-                    <p className={`text-sm font-mono font-bold ${isRecording ? "text-rose-500 animate-pulse" : "text-[#E0E0E0]"}`}>
-                      {formatTime(recordingDuration)}
-                    </p>
-                    <p className="text-[10px] text-[#71717A] mt-1 font-mono uppercase tracking-wider">
-                      {isRecording ? "Sedang merekam suara dari mikrofon internal..." : "Tekan tombol untuk merekam audio."}
-                    </p>
+                    {/* RECORD MODE */}
+                    {inputMode === "record" && (
+                      <>
+                        {/* Microphone Pulse Animation when recording */}
+                        <div className="relative my-4 flex items-center justify-center">
+                          {isRecording && (
+                            <>
+                              <span className="absolute inline-flex h-24 w-24 rounded-full bg-rose-500 opacity-10 animate-ping pointer-events-none"></span>
+                              <span className="absolute inline-flex h-20 w-20 rounded-full bg-rose-500 opacity-20 animate-pulse pointer-events-none"></span>
+                            </>
+                          )}
+                          <button
+                            onClick={isRecording ? stopRecording : startRecording}
+                            className={`w-16 h-16 rounded-sm flex items-center justify-center text-white transition-all cursor-pointer ${
+                              isRecording
+                                ? "bg-rose-600 hover:bg-rose-700"
+                                : "bg-indigo-600 hover:bg-indigo-700"
+                            }`}
+                          >
+                            {isRecording ? <Square className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                          </button>
+                        </div>
+
+                        <p className={`text-sm font-mono font-bold ${isRecording ? "text-rose-500 animate-pulse" : "text-[#E0E0E0]"}`}>
+                          {formatTime(recordingDuration)}
+                        </p>
+                        <p className="text-[10px] text-[#71717A] mt-1 font-mono uppercase tracking-wider">
+                          {isRecording ? "Sedang merekam suara dari mikrofon internal..." : "Tekan tombol untuk merekam audio."}
+                        </p>
+                      </>
+                    )}
+
+                    {/* UPLOAD MODE */}
+                    {inputMode === "upload" && (
+                      <div className="w-full flex flex-col items-center my-4">
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="audio/*"
+                          onChange={handleFileSelected}
+                          className="hidden"
+                        />
+                        <button
+                          onClick={() => fileInputRef.current?.click()}
+                          className="w-full bg-[#0A0A0B] border-2 border-dashed border-[#262626] hover:border-indigo-600/50 rounded-sm py-8 px-4 flex flex-col items-center gap-2 transition-all cursor-pointer"
+                        >
+                          <Upload className="w-8 h-8 text-[#71717A]" />
+                          <span className="text-xs font-bold uppercase tracking-wider text-[#71717A]">
+                            Klik untuk pilih file audio
+                          </span>
+                          <span className="text-[9px] text-[#535358] font-mono">
+                            Format: MP3, WAV, OGG, WEBM, M4A, FLAC, dsb.
+                          </span>
+                        </button>
+
+                        {uploadedFileName && (
+                          <div className="mt-3 w-full bg-[#0A0A0B] border border-[#262626] rounded-sm p-2.5 flex items-center gap-2">
+                            <FileAudio className="w-4 h-4 text-indigo-400 shrink-0" />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[11px] text-[#E0E0E0] font-mono truncate">{uploadedFileName}</p>
+                              {uploadedFileDuration > 0 && (
+                                <p className="text-[9px] text-[#71717A] font-mono">
+                                  Durasi: {formatTime(uploadedFileDuration)} | Tipe: {uploadedFileType || "audio/*"}
+                                </p>
+                              )}
+                            </div>
+                            <button
+                              onClick={() => {
+                                setUploadedFileBase64(null);
+                                setUploadedFileName(null);
+                                setUploadedFileType(null);
+                                setUploadedFileDuration(0);
+                                setOfflineStatus(null);
+                              }}
+                              className="text-[#71717A] hover:text-red-400 transition-colors cursor-pointer"
+                            >
+                              <XCircle className="w-4 h-4" />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {/* Offline Buffer Warning */}
                     {offlineStatus && (
-                      <div className="mt-4 bg-indigo-950/40 border border-indigo-900/30 p-2.5 rounded-sm text-[11px] text-indigo-300 flex items-start gap-1.5 text-left font-sans">
+                      <div className="mt-2 w-full bg-indigo-950/40 border border-indigo-900/30 p-2.5 rounded-sm text-[11px] text-indigo-300 flex items-start gap-1.5 text-left font-sans">
                         <HardDrive className="w-4 h-4 shrink-0 mt-0.5 text-indigo-400" />
                         <p>{offlineStatus}</p>
                       </div>
                     )}
 
-                    {/* Sync form when recorded file exists */}
-                    {recordedBase64 && !isRecording && (
+                    {/* Sync form when audio is ready (recorded or uploaded) */}
+                    {((inputMode === "record" && recordedBase64 && !isRecording) || (inputMode === "upload" && uploadedFileBase64)) && (
                       <div className="mt-4 w-full border-t border-[#262626] pt-4 space-y-3 text-left">
                         <div>
                           <label className="block text-xs font-bold uppercase tracking-wider text-[#A1A1AA] mb-1">Judul Rapat</label>
@@ -788,7 +943,7 @@ export default function App() {
                           Belum ada catatan rapat. Mulai merekam untuk menambahkan catatan baru.
                         </div>
                       ) : (
-                        notes.map((note) => {
+                        [...notes].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).map((note) => {
                           const isExpanded = expandedNoteId === note.id;
                           return (
                             <div
@@ -1094,6 +1249,60 @@ export default function App() {
                   }`}
                 >
                   <Database className="w-3 h-3" /> Relational DB
+                </button>
+                <button
+                  onClick={() => setAdminTab("provider")}
+                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${
+              {/* TAB 4: AI PROVIDER INFO */}
+              {adminTab === "provider" && (
+                <div className="space-y-3">
+                  <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">Konfigurasi AI Provider</h4>
+                  <div className="bg-[#18181B] border border-[#262626] rounded-sm p-4 space-y-3">
+                    {adminProviderInfo ? (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] uppercase tracking-wider text-[#71717A] font-mono">Provider Aktif</span>
+                          <span className="text-xs font-bold text-purple-400 uppercase tracking-wider bg-purple-950/30 border border-purple-900/40 px-2 py-0.5 rounded-sm">
+                            {adminProviderInfo.provider === "none" ? "Tidak Ada (Simulasi)" : adminProviderInfo.provider}
+                          </span>
+                        </div>
+                        <div className="border-t border-[#262626] pt-2 space-y-2">
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span className="text-[#71717A]">Model STT</span>
+                            <span className="text-[#E0E0E0] font-mono">{adminProviderInfo.modelSTT}</span>
+                          </div>
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span className="text-[#71717A]">Model LLM</span>
+                            <span className="text-[#E0E0E0] font-mono">{adminProviderInfo.modelLLM}</span>
+                          </div>
+                        </div>
+                        <div className="border-t border-[#262626] pt-2 text-[10px] text-[#535358] font-sans leading-relaxed">
+                          {adminProviderInfo.provider === "gemini" && "Menggunakan Google Gemini API untuk STT (audio-to-text) dan LLM (ranguman)."}
+                          {adminProviderInfo.provider === "openai" && "Menggunakan OpenAI API: Whisper untuk STT dan GPT untuk rangkuman."}
+                          {adminProviderInfo.provider === "9router" && "Menggunakan 9router (OpenAI-compatible) sebagai proxy AI."}
+                          {adminProviderInfo.provider === "anthropic" && "Menggunakan Anthropic Claude untuk LLM (rangkuman). STT tidak didukung - menggunakan simulasi."}
+                          {adminProviderInfo.provider === "none" && "Tidak ada API key terdeteksi. Sistem berjalan dalam mode simulasi."}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-[11px] text-[#71717A] font-mono">Memuat informasi provider...</p>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-[#535358] font-mono leading-relaxed">
+                    Atur provider AI melalui file <span className="text-indigo-400">.env.local</span>. 
+                    Variable: <span className="text-indigo-400">AI_PROVIDER</span> (gemini, openai, 9router, anthropic), 
+                    <span className="text-indigo-400"> GEMINI_API_KEY</span>, 
+                    <span className="text-indigo-400"> OPENAI_API_KEY</span>, 
+                    <span className="text-indigo-400"> ANTHROPIC_API_KEY</span>, 
+                    <span className="text-indigo-400"> AI_BASE_URL</span> (khusus 9router), 
+                    <span className="text-indigo-400"> AI_MODEL_LLM</span>.
+                  </p>
+                </div>
+              )}
+                    adminTab === "provider" ? "bg-[#262626] text-purple-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
+                  }`}
+                >
+                  <Settings className="w-3 h-3" /> AI Provider
                 </button>
               </div>
             </div>

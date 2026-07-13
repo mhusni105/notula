@@ -10,7 +10,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import { GoogleGenAI } from "@google/genai";
+import { createProvider, AIProvider } from "./src/ai-provider.js";
 import { createServer as createViteServer } from "vite";
 import { ProcessStatus, ServerLog, NoteTemplate, Note, AccountTier } from "./src/types.js";
 
@@ -69,6 +69,25 @@ function decryptText(encryptedText: string | null): string {
   }
 }
 
+function getAudioFileExt(fileName: string): string {
+  const ext = path.extname(fileName).toLowerCase().replace(/^\./, "");
+  return ext || "webm";
+}
+
+function getMimeType(ext: string): string {
+  const mimeMap: Record<string, string> = {
+    webm: "audio/webm",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    m4a: "audio/mp4",
+    flac: "audio/flac",
+    aac: "audio/aac",
+    mp4: "audio/mp4",
+    wma: "audio/x-ms-wma",
+  };
+  return mimeMap[ext] || "audio/webm";
+}
 // Relational DB Logic (db.json)
 interface DB {
   account_tiers: AccountTier[];
@@ -140,24 +159,14 @@ function writeDB(db: DB) {
 let db = readDB();
 addLog("success", "Database relasional dimuat berhasil", `Users: ${db.users.length}, Templates: ${db.templates.length}`);
 
-// Initialize Gemini SDK with User-Agent for Telemetry
-let ai: GoogleGenAI | null = null;
-if (process.env.GEMINI_API_KEY) {
-  try {
-    ai = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
-    addLog("success", "Gemini AI SDK diinisialisasi berhasil menggunakan GEMINI_API_KEY.");
-  } catch (err) {
-    addLog("error", "Gagal menginisialisasi Gemini AI SDK", String(err));
-  }
+// Initialize AI Provider (supports Gemini, OpenAI, 9router, Anthropic via env AI_PROVIDER)
+let provider: AIProvider | null = null;
+provider = createProvider();
+if (provider) {
+  const info = provider.getProviderInfo();
+  addLog("success", `AI Provider "${info.provider}" berhasil diinisialisasi`, `STT: ${info.modelSTT}, LLM: ${info.modelLLM}`);
 } else {
-  addLog("warning", "GEMINI_API_KEY tidak terdeteksi di env. Fitur STT & LLM akan menghasilkan simulasi cerdas.");
+  addLog("warning", "Tidak ada AI API Key terdeteksi. Fitur STT & LLM akan menghasilkan simulasi cerdas.");
 }
 
 // Background Worker for processing transcription and summaries
@@ -185,7 +194,8 @@ async function processQueue() {
 
       if (pendingNote.status === ProcessStatus.TRANSCRIBING) {
         addLog("info", `Fase Transkripsi dimulai untuk catatan: "${pendingNote.title}"`);
-        const driveFilePath = pendingNote.gdriveFileId ? path.join(GDRIVE_SIM_DIR, `${pendingNote.gdriveFileId}.webm`) : null;
+        const audioFileExt = pendingNote.fileName ? getAudioFileExt(pendingNote.fileName) : "webm";
+        const driveFilePath = pendingNote.gdriveFileId ? path.join(GDRIVE_SIM_DIR, `${pendingNote.gdriveFileId}.${audioFileExt}`) : null;
 
         if (!driveFilePath || !fs.existsSync(driveFilePath)) {
           throw new Error("File audio tidak ditemukan di Google Drive (gdriveFileId salah atau hilang).");
@@ -193,34 +203,28 @@ async function processQueue() {
 
         let transcriptionResult = "";
 
-        if (ai) {
+        if (provider) {
           try {
-            addLog("info", "Mengirimkan file audio ke Gemini untuk proses transkripsi teks (STT)...");
-            const audioData = fs.readFileSync(driveFilePath);
-            const base64Audio = audioData.toString("base64");
-
-            const response = await ai.models.generateContent({
-              model: "gemini-3.5-flash",
-              contents: [
-                {
-                  inlineData: {
-                    mimeType: "audio/webm",
-                    data: base64Audio,
-                  },
-                },
-                "Lakukan transkripsi verbatim (kata-demi-kata) secara lengkap dan akurat dari audio terlampir dalam Bahasa Indonesia dan Bahasa Inggris jika bercampur. Tuliskan teks transkripsi saja tanpa komentar pembuka, penjelasan, atau penutup.",
-              ],
-            });
-
-            transcriptionResult = response.text || "[Tidak ada teks terdeteksi]";
-            addLog("success", "Proses transkripsi STT via Gemini selesai berhasil.");
+            const providerInfo = provider.getProviderInfo();
+            addLog("info", `Mengirimkan file audio ke ${providerInfo.provider} untuk proses transkripsi teks (STT)...`);
+            const mimeType = getMimeType(audioFileExt);
+            transcriptionResult = await provider.transcribeAudio(driveFilePath, mimeType);
+            addLog("success", `Proses transkripsi STT via ${providerInfo.provider} selesai berhasil.`);
           } catch (err: any) {
-            addLog("error", "Gagal memproses STT menggunakan Gemini API", String(err));
-            throw new Error(`API STT Gagal: ${err.message || String(err)}`);
+            addLog("error", `Gagal memproses STT`, String(err));
+            // If Anthropic (no STT), fall back to simulation
+            if (String(err).includes("Anthropic tidak mendukung")) {
+              addLog("warning", "Anthropic tidak mendukung STT. Menggunakan SIMULASI transkripsi.");
+              await new Promise((r) => setTimeout(r, 2000));
+              transcriptionResult = `[SIMULASI TRANSKRIPSI - Anthropic tidak memiliki STT API]
+Percakapan ini tidak dapat ditranskripsi karena provider AI yang dipilih (Anthropic/Claude) tidak mendukung transkripsi audio. Silakan ganti ke Gemini atau OpenAI untuk fitur STT.`;
+            } else {
+              throw new Error(`API STT Gagal: ${err.message || String(err)}`);
+            }
           }
         } else {
-          // Simulation mode when API Key is missing
-          addLog("warning", "Menggunakan SIMULASI STT karena GEMINI_API_KEY tidak ada.");
+          // Simulation mode when no API Key is detected
+          addLog("warning", "Menggunakan SIMULASI STT karena tidak ada API Key terdeteksi.");
           await new Promise((r) => setTimeout(r, 4000));
           transcriptionResult = `[SIMULASI TRANSKRIPSI]
 Halo selamat pagi rekan-rekan sekalian. Terima kasih sudah hadir dalam rapat koordinasi proyek Note-Taker hari ini tanggal 11 Juli 2026.
@@ -258,28 +262,20 @@ Untuk action items, Budi harap segera selesaikan modul sync offline di mobile, l
         const selectedTemplate = db.templates.find((t) => t.id === pendingNote.templateId) || db.templates[0];
         let summaryResult = "";
 
-        if (ai) {
+        if (provider) {
           try {
-            addLog("info", `Menggunakan Template: "${selectedTemplate.name}" - Mengirimkan instruksi ke Gemini...`);
+            const providerInfo = provider.getProviderInfo();
+            addLog("info", `Menggunakan Template: "${selectedTemplate.name}" - Mengirimkan instruksi ke ${providerInfo.provider}...`);
             const finalPrompt = selectedTemplate.userPromptTemplate.replace("{{TRANSCRIPTION}}", decryptedSTT);
-
-            const response = await ai.models.generateContent({
-              model: "gemini-3.5-flash",
-              contents: finalPrompt,
-              config: {
-                systemInstruction: selectedTemplate.systemPrompt,
-              },
-            });
-
-            summaryResult = response.text || "[Gagal merangkum]";
-            addLog("success", `Rangkuman berhasil digenerate menggunakan template "${selectedTemplate.name}"`);
+            summaryResult = await provider.generateSummary(selectedTemplate.systemPrompt, finalPrompt);
+            addLog("success", `Rangkuman berhasil digenerate menggunakan template "${selectedTemplate.name}" via ${providerInfo.provider}`);
           } catch (err: any) {
-            addLog("error", "Gagal memproses Ringkasan menggunakan Gemini API", String(err));
+            addLog("error", `Gagal memproses Ringkasan`, String(err));
             throw new Error(`API LLM Ringkasan Gagal: ${err.message || String(err)}`);
           }
         } else {
-          // Simulation mode when API Key is missing
-          addLog("warning", "Menggunakan SIMULASI Rangkuman karena GEMINI_API_KEY tidak ada.");
+          // Simulation mode when no API Key is detected
+          addLog("warning", "Menggunakan SIMULASI Rangkuman karena tidak ada API Key terdeteksi.");
           await new Promise((r) => setTimeout(r, 4000));
           summaryResult = `### RINGKASAN EKSEKUTIF
 Rapat koordinasi proyek AI Note-Taker pada 11 Juli 2026 berhasil membahas status pengembangan MVP pertama. Agenda utama berfokus pada sinkronisasi penyimpanan cloud, keamanan enkripsi, dan koordinasi rilis. Budi telah menyelesaikan integrasi penyimpanan Google Drive yang hemat penyimpanan lokal dengan langsung menghapus file audio lokal setelah unggahan diverifikasi. Ani mengonfirmasi bahwa enkripsi data teks menggunakan protokol AES-256-CBC pada tingkat aplikasi telah bekerja dengan baik sebelum disimpan ke database, memastikan kerahasiaan data pengguna. Tim menargetkan peluncuran MVP stabil dalam waktu dua hari ke depan.
@@ -450,7 +446,7 @@ app.get("/api/notes", (req, res) => {
 });
 
 app.post("/api/notes/upload", (req, res) => {
-  const { userId, title, durationSeconds, audioBase64, templateId } = req.body;
+  const { userId, title, durationSeconds, audioBase64, templateId, fileName: reqFileName } = req.body;
 
   if (!userId || !title || !audioBase64 || !templateId) {
     return res.status(400).json({ error: "Parameter wajib diisi: userId, title, audioBase64, templateId." });
@@ -473,7 +469,8 @@ app.post("/api/notes/upload", (req, res) => {
   }
 
   const noteId = `note-${Date.now()}`;
-  const localFileName = `audio_${noteId}.webm`;
+  const audioExt = reqFileName ? getAudioFileExt(reqFileName) : "webm";
+  const localFileName = `audio_${noteId}.${audioExt}`;
   const localFilePath = path.join(UPLOADS_DIR, localFileName);
 
   try {
@@ -486,7 +483,7 @@ app.post("/api/notes/upload", (req, res) => {
 
     // NFR-02.1 & NFR-02.2: Stream/simulasikan unggah ke Google Drive
     const gdriveFileId = `gdrive_${noteId}`;
-    const driveFilePath = path.join(GDRIVE_SIM_DIR, `${gdriveFileId}.webm`);
+    const driveFilePath = path.join(GDRIVE_SIM_DIR, `${gdriveFileId}.${audioExt}`);
 
     addLog("info", `Mulai streaming data dari server lokal ke Google Drive Cloud Storage...`);
     fs.writeFileSync(driveFilePath, audioBuffer); // simulate successful cloud write
@@ -506,7 +503,7 @@ app.post("/api/notes/upload", (req, res) => {
       durationSeconds,
       status: ProcessStatus.UPLOADING, // Will trigger worker to start STT/LLM
       gdriveFileId,
-      fileName: localFileName,
+      fileName: reqFileName || localFileName,
       transcriptionEncrypted: null,
       summaryEncrypted: null,
       errorMessage: null,
@@ -530,6 +527,13 @@ app.post("/api/notes/upload", (req, res) => {
 
 // 4. Admin API & Real-time inspector
 app.get("/api/admin/logs", (req, res) => {
+app.get("/api/admin/provider", (_req, res) => {
+  if (provider) {
+    res.json(provider.getProviderInfo());
+  } else {
+    res.json({ provider: "none", modelSTT: "simulasi", modelLLM: "simulasi" });
+  }
+});
   res.json(logsBuffer);
 });
 
