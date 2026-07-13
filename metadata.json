@@ -1,0 +1,6 @@
+{
+  "name": "AI Note-Taker",
+  "description": "Sistem AI Note-Taker mandiri (self-hosted) untuk merekam audio, mengunggah ke Google Drive, transkripsi asinkron, dan rangkuman rapat terenkripsi.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
