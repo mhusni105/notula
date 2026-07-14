@@ -2,7 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  * 
- * AI Provider abstraction — supports Gemini, OpenAI, 9router, and Anthropic.
+ * AI Provider abstraction ï¿½ supports Gemini, OpenAI, 9router, and Anthropic.
  */
 
 import { GoogleGenAI } from "@google/genai";
@@ -90,13 +90,15 @@ class GeminiProvider implements AIProvider {
 class OpenAIProvider implements AIProvider {
   private apiKey: string;
   private baseURL: string;
+  private sttEndpoint?: string;  // explicit STT endpoint URL, overrides baseURL path
   private modelSTT = "whisper-1";
   private modelLLM = "gpt-4o-mini";
 
-  constructor(apiKey: string, baseURL: string, modelLLM?: string) {
+  constructor(apiKey: string, baseURL: string, modelLLM?: string, sttEndpoint?: string) {
     this.apiKey = apiKey;
     this.baseURL = baseURL.replace(/\/+$/, "");
     if (modelLLM) this.modelLLM = modelLLM;
+    if (sttEndpoint) this.sttEndpoint = sttEndpoint;
   }
 
   async transcribeAudio(audioFilePath: string, _mimeType: string, signal?: AbortSignal): Promise<string> {
@@ -110,7 +112,8 @@ class OpenAIProvider implements AIProvider {
     formData.append("model", this.modelSTT);
     formData.append("response_format", "text");
 
-    const res = await fetch(`${this.baseURL}/audio/transcriptions`, {
+    const sttUrl = this.sttEndpoint || `${this.baseURL}/audio/transcriptions`;
+    const res = await fetch(sttUrl, {
       method: "POST",
       headers: { Authorization: `Bearer ${this.apiKey}` },
       body: formData,
@@ -119,7 +122,7 @@ class OpenAIProvider implements AIProvider {
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} from Whisper API: ${body.slice(0, 300)}`);
+      throw new Error(`HTTP ${res.status} dari ${sttUrl} â€” ${body.slice(0, 300)}`);
     }
 
     const text = await res.text();
@@ -216,11 +219,13 @@ class AnthropicProvider implements AIProvider {
  * | `AI_BASE_URL`     | Custom base URL (required for 9router, optional for openai) |
  * | `AI_MODEL_STT`    | Override the STT model name                      |
  * | `AI_MODEL_LLM`    | Override the LLM model name                      |
+ | `AI_STT_ENDPOINT` | Full URL for STT API (override for proxies/9router) |
  */
 export function createProvider(): AIProvider | null {
   const providerType = (process.env.AI_PROVIDER || "gemini") as AIProviderType;
   const modelLLM = process.env.AI_MODEL_LLM;
   const baseURL = process.env.AI_BASE_URL;
+  const sttEndpoint = process.env.AI_STT_ENDPOINT;
 
   switch (providerType) {
     case "gemini": {
@@ -240,14 +245,14 @@ export function createProvider(): AIProvider | null {
       const key = process.env.OPENAI_API_KEY;
       if (!key) return null;
       const url = baseURL || "https://api.openai.com/v1";
-      return new OpenAIProvider(key, url, modelLLM);
+      return new OpenAIProvider(key, url, modelLLM, sttEndpoint);
     }
 
     case "9router": {
       const key = process.env.OPENAI_API_KEY;
       if (!key) return null;
       const url = baseURL || "https://api.9router.com/v1";  // sensible default
-      return new OpenAIProvider(key, url, modelLLM);
+      return new OpenAIProvider(key, url, modelLLM, sttEndpoint);
     }
 
     case "anthropic": {

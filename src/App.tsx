@@ -1253,8 +1253,7 @@ export default function App() {
                 <button
                   onClick={() => setAdminTab("provider")}
                   className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${
-              {/* TAB 4: AI PROVIDER INFO */}
-              {adminTab === "provider" && (
+                  adminTab === "provider" && (
                 <div className="space-y-3">
                   <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">Konfigurasi AI Provider</h4>
                   <div className="bg-[#18181B] border border-[#262626] rounded-sm p-4 space-y-3">
@@ -1492,26 +1491,14 @@ export default function App() {
                                 <td className="p-3 text-[#E0E0E0] font-sans">{n.title}</td>
                                 <td className="p-3 text-[#A1A1AA]">{n.templateId}</td>
                                 <td className="p-3 max-w-[200px] truncate-text">
-                                  {decryptAdminDb ? (
-                                    <span className="text-emerald-400 whitespace-pre-wrap font-sans">
-                                      {notes.find((note) => note.id === n.id)?.transcription || "..."}
-                                    </span>
-                                  ) : (
-                                    <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
-                                      {n.transcriptionEncrypted || "NULL"}
-                                    </span>
-                                  )}
+                                  <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
+                                    {n.transcriptionEncrypted || "NULL"}
+                                  </span>
                                 </td>
                                 <td className="p-3 max-w-[200px] truncate-text">
-                                  {decryptAdminDb ? (
-                                    <span className="text-emerald-400 whitespace-pre-wrap font-sans">
-                                      {notes.find((note) => note.id === n.id)?.summary || "..."}
-                                    </span>
-                                  ) : (
-                                    <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
-                                      {n.summaryEncrypted || "NULL"}
-                                    </span>
-                                  )}
+                                  <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
+                                    {n.summaryEncrypted || "NULL"}
+                                  </span>
                                 </td>
                               </tr>
                             ))
