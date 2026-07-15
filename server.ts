@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -11,8 +11,10 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { createProvider, AIProvider } from "./src/ai-provider.js";
+import { startWhisperServer, stopWhisperServer, getWhisperStatus } from "./src/whisper-local.js";
 import { createServer as createViteServer } from "vite";
 import { ProcessStatus, ServerLog, NoteTemplate, Note, AccountTier } from "./src/types.js";
+import { google } from "googleapis";
 
 
 // Initialize directories
@@ -91,7 +93,7 @@ function getMimeType(ext: string): string {
 // Relational DB Logic (db.json)
 interface DB {
   account_tiers: AccountTier[];
-  users: Array<{ id: string; username: string; password_hash: string; tierId: string }>;
+  users: Array<{ id: string; username: string; password_hash: string; tierId: string; authMethod: string; googleId?: string; googleEmail?: string; googleTokens?: any }>;
   templates: NoteTemplate[];
   notes: Note[];
 }
@@ -101,10 +103,7 @@ const defaultDB: DB = {
     { id: "tier-free", name: "Free Tier", maxDurationSeconds: 600, description: "Maksimal durasi perekaman 10 menit per sesi (uji coba)." },
     { id: "tier-premium", name: "Premium Tier", maxDurationSeconds: 3600, description: "Maksimal durasi perekaman 1 jam per sesi (Sesuai FR-02.2)." }
   ],
-  users: [
-    { id: "user-1", username: "admin", password_hash: "admin123", tierId: "tier-premium" },
-    { id: "user-2", username: "budi", password_hash: "budi123", tierId: "tier-free" }
-  ],
+  users: [],
   templates: [
     {
       id: "tpl-rapat-proyek",
@@ -167,10 +166,165 @@ if (provider) {
   addLog("success", `AI Provider "${info.provider}" berhasil diinisialisasi`, `STT: ${info.modelSTT}, LLM: ${info.modelLLM}`);
 } else {
   addLog("warning", "Tidak ada AI API Key terdeteksi. Fitur STT & LLM akan menghasilkan simulasi cerdas.");
+
+// Auto-start Whisper local server if provider is whisper-local
+(async () => {
+  addLog("info", "Menginisialisasi Whisper Local STT middleware...");
+  try {
+    const whisperInfo = await startWhisperServer();
+    addLog("success", `Whisper Local STT siap`, `Port: ${whisperInfo.port}, PID: ${whisperInfo.pid}`);
+  } catch (err) {
+    addLog("error", "Gagal memulai Whisper Local STT", String(err));
+    addLog("warning", "Fitur STT lokal tidak tersedia. Periksa instalasi Python dan dependensi whisper.");
+  }
+})();
+
 }
 
 // Background Worker for processing transcription and summaries
 const queueProcessingActive = { value: false };
+
+
+// Google OAuth 2.0 Client Setup
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "http://localhost:3000/api/auth/google/callback";
+
+let googleOAuth2Client: any = null;
+if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
+  googleOAuth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URI
+  );
+  addLog("success", "Google OAuth 2.0 Client berhasil diinisialisasi");
+} else {
+  addLog("warning", "GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET tidak diisi. Login Google/Google Drive tidak tersedia.", "Set di .env.local untuk mengaktifkan");
+}
+
+// Helper: get Google OAuth URL for consent
+function getGoogleAuthUrl(): string {
+  if (!googleOAuth2Client) return "";
+  return googleOAuth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: [
+      "https://www.googleapis.com/auth/userinfo.profile",
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/drive.file",
+    ],
+  });
+}
+
+// Helper: get user profile from Google
+async function getGoogleProfile(accessToken: string): Promise<{ id: string; email: string; name: string } | null> {
+  try {
+    const oauth2 = google.oauth2({ version: "v2" });
+    const { data } = await oauth2.userinfo.get({ oauth_token: accessToken });
+    return { id: data.id || "", email: data.email || "", name: data.name || "" };
+  } catch (err) {
+    addLog("error", "Gagal mengambil profil Google", String(err));
+    return null;
+  }
+}
+
+// Helper: upload file to real Google Drive
+async function uploadToGoogleDrive(
+  userId: string,
+  fileName: string,
+  fileBuffer: Buffer,
+  mimeType: string
+): Promise<{ fileId: string; error?: string }> {
+  const db = readDB();
+  const user = db.users.find((u) => u.id === userId);
+  if (!user || !user.googleTokens?.access_token) {
+    return { fileId: "", error: "Google Drive tidak terautentikasi" };
+  }
+
+  try {
+    // Set credentials from stored tokens
+    googleOAuth2Client!.setCredentials({
+      access_token: user.googleTokens.access_token,
+      refresh_token: user.googleTokens.refresh_token,
+      expiry_date: user.googleTokens.expiry_date,
+    });
+
+    const drive = google.drive({ version: "v3", auth: googleOAuth2Client! });
+    const response = await drive.files.create({
+      requestBody: {
+        name: fileName,
+        parents: [], // Upload to root
+      },
+      media: {
+        mimeType: mimeType,
+        body: fileBuffer,
+      },
+    });
+
+    return { fileId: response.data.id || "" };
+  } catch (err: any) {
+    // If token expired, try refresh
+    if (err?.response?.status === 401 && user.googleTokens.refresh_token) {
+      try {
+        googleOAuth2Client!.setCredentials({
+          refresh_token: user.googleTokens.refresh_token,
+        });
+        const { credentials } = await googleOAuth2Client!.refreshAccessToken();
+        
+        // Update stored tokens
+        const db2 = readDB();
+        const idx = db2.users.findIndex((u) => u.id === userId);
+        if (idx !== -1) {
+          db2.users[idx].googleTokens = {
+            access_token: credentials.access_token,
+            refresh_token: credentials.refresh_token || user.googleTokens.refresh_token,
+            expiry_date: credentials.expiry_date,
+            scope: credentials.scope,
+            token_type: credentials.token_type,
+          };
+          writeDB(db2);
+        }
+
+        // Retry upload with new token
+        const drive = google.drive({ version: "v3", auth: googleOAuth2Client! });
+        const response = await drive.files.create({
+          requestBody: { name: fileName, parents: [] },
+          media: { mimeType: mimeType, body: fileBuffer },
+        });
+        return { fileId: response.data.id || "" };
+      } catch (refreshErr: any) {
+        return { fileId: "", error: `Gagal refresh token: ${refreshErr.message}` };
+      }
+    }
+    return { fileId: "", error: `Google Drive upload gagal: ${err.message || String(err)}` };
+  }
+}
+
+// Helper: list real Google Drive files
+async function listGoogleDriveFiles(userId: string): Promise<any[]> {
+  const db = readDB();
+  const user = db.users.find((u) => u.id === userId);
+  if (!user || !user.googleTokens?.access_token) return [];
+
+  try {
+    googleOAuth2Client!.setCredentials({
+      access_token: user.googleTokens.access_token,
+      refresh_token: user.googleTokens.refresh_token,
+      expiry_date: user.googleTokens.expiry_date,
+    });
+
+    const drive = google.drive({ version: "v3", auth: googleOAuth2Client! });
+    const response = await drive.files.list({
+      pageSize: 50,
+      fields: "files(id, name, size, mimeType, createdTime, modifiedTime)",
+    });
+
+    return response.data.files || [];
+  } catch (err) {
+    addLog("error", "Gagal mengambil daftar file Google Drive", String(err));
+    return [];
+  }
+}
 
 async function processQueue() {
   if (queueProcessingActive.value) return;
@@ -342,60 +496,141 @@ app.use(express.urlencoded({ limit: "150mb", extended: true }));
 // REST API Endpoints
 
 // 1. Auth APIs
-app.post("/api/auth/login", (req, res) => {
-  const { username, password } = req.body;
-  db = readDB();
-  const user = db.users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+// Google OAuth Routes
+app.get("/api/auth/google", (req, res) => {
+  const authUrl = getGoogleAuthUrl();
+  if (!authUrl) {
+    return res.status(400).json({ error: "Google OAuth tidak dikonfigurasi. Set GOOGLE_CLIENT_ID dan GOOGLE_CLIENT_SECRET di .env.local" });
+  }
+  addLog("info", "Mengarahkan pengguna ke Google OAuth consent screen...");
+  res.redirect(authUrl);
+});
 
-  if (!user || user.password_hash !== password) {
-    addLog("warning", "Gagal login: Username atau password salah", `User: ${username}`);
-    return res.status(401).json({ error: "Username atau password salah." });
+app.get("/api/auth/google/callback", async (req, res) => {
+  const { code } = req.query;
+  if (!code) {
+    return res.status(400).json({ error: "Kode otorisasi tidak ditemukan." });
   }
 
-  // Find account tier
-  const tier = db.account_tiers.find((t) => t.id === user.tierId) || db.account_tiers[0];
-  const token = `session_${crypto.randomBytes(16).toString("hex")}`;
-  addLog("success", "Pengguna berhasil masuk (Login)", `User: ${user.username} (${tier.name})`);
+  try {
+    // Exchange authorization code for tokens
+    const { tokens } = await googleOAuth2Client!.getToken(code as string);
+    googleOAuth2Client!.setCredentials(tokens);
 
+    // Get Google profile
+    const profile = await getGoogleProfile(tokens.access_token!);
+    if (!profile) {
+      return res.status(500).json({ error: "Gagal mengambil profil Google." });
+    }
+
+    // Check if user already exists by googleId
+    db = readDB();
+    let user = db.users.find((u) => u.googleId === profile.id);
+    let isNewUser = false;
+
+    if (!user) {
+      // Also check by email
+      user = db.users.find((u) => u.googleEmail === profile.email);
+    }
+
+    if (!user) {
+      // Register new Google user
+      const newUser = {
+        id: `user-${Date.now()}`,
+        username: profile.name || profile.email,
+        password_hash: "", // No password for Google users
+        tierId: "tier-premium", // Google users get premium
+        authMethod: "google",
+        googleId: profile.id,
+        googleEmail: profile.email,
+        googleTokens: {
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token,
+          scope: tokens.scope,
+          token_type: tokens.token_type,
+          expiry_date: tokens.expiry_date,
+        },
+      };
+      db.users.push(newUser);
+      writeDB(db);
+      isNewUser = true;
+      addLog("success", "Pengguna baru mendaftar dengan Google", `Email: ${profile.email}`);
+    } else {
+      // Update existing user's tokens
+      db = readDB();
+      const idx = db.users.findIndex((u) => u.id === user!.id);
+      if (idx !== -1) {
+        db.users[idx].googleTokens = {
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token || db.users[idx].googleTokens?.refresh_token,
+          scope: tokens.scope,
+          token_type: tokens.token_type,
+          expiry_date: tokens.expiry_date,
+        };
+        if (!db.users[idx].googleId) db.users[idx].googleId = profile.id;
+        if (!db.users[idx].googleEmail) db.users[idx].googleEmail = profile.email;
+        if (!db.users[idx].authMethod || db.users[idx].authMethod === "local") db.users[idx].authMethod = "google";
+        writeDB(db);
+      }
+      addLog("success", "Pengguna masuk dengan Google", `Email: ${profile.email}`);
+    }
+
+    // Re-read fresh data
+    db = readDB();
+    const updatedUser = db.users.find((u) => u.id === (user?.id || db.users[db.users.length - 1].id))!;
+    const tier = db.account_tiers.find((t) => t.id === updatedUser.tierId) || db.account_tiers[0];
+    const sessionToken = `session_${crypto.randomBytes(16).toString("hex")}`;
+
+    // Redirect to frontend with token and user info
+    const redirectUrl = `/?googleAuth=success&token=${encodeURIComponent(sessionToken)}&userId=${encodeURIComponent(updatedUser.id)}&username=${encodeURIComponent(updatedUser.username)}&email=${encodeURIComponent(profile.email)}&tierId=${encodeURIComponent(updatedUser.tierId)}&tierName=${encodeURIComponent(tier.name)}&maxDuration=${tier.maxDurationSeconds}&authMethod=google&isNew=${isNewUser}`;
+    res.redirect(redirectUrl);
+  } catch (err: any) {
+    addLog("error", "Google OAuth callback gagal", String(err));
+    res.redirect(`/?googleAuth=error&message=${encodeURIComponent(err.message || "Gagal autentikasi Google")}`);
+  }
+});
+
+// Check Google auth status for a user
+app.get("/api/auth/google/status", (req, res) => {
+  const { userId } = req.query;
+  if (!userId) {
+    return res.status(400).json({ error: "Parameter userId diperlukan" });
+  }
+  db = readDB();
+  const user = db.users.find((u) => u.id === userId);
+  if (!user) {
+    return res.status(404).json({ error: "User tidak ditemukan" });
+  }
+  
+  const hasGoogleDrive = !!(user.googleTokens?.access_token);
   res.json({
-    user: { id: user.id, username: user.username, tierId: user.tierId },
-    tier,
-    token,
+    authMethod: user.authMethod || "local",
+    googleId: user.googleId || null,
+    googleEmail: user.googleEmail || null,
+    hasGoogleDrive,
+    googleDriveConnected: hasGoogleDrive,
   });
 });
 
-app.post("/api/auth/register", (req, res) => {
-  const { username, password, tierId } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: "Username dan password wajib diisi." });
+// Disconnect Google account
+app.post("/api/auth/google/disconnect", (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: "Parameter userId diperlukan" });
   }
-
   db = readDB();
-  const exists = db.users.find((u) => u.username.toLowerCase() === username.toLowerCase());
-  if (exists) {
-    return res.status(400).json({ error: "Username sudah digunakan." });
+  const idx = db.users.findIndex((u) => u.id === userId);
+  if (idx === -1) {
+    return res.status(404).json({ error: "User tidak ditemukan" });
   }
-
-  const selectedTierId = tierId || "tier-free";
-  const newUser = {
-    id: `user-${Date.now()}`,
-    username,
-    password_hash: password,
-    tierId: selectedTierId,
-  };
-
-  db.users.push(newUser);
+  
+  db.users[idx].googleTokens = null;
+  db.users[idx].authMethod = "local";
   writeDB(db);
-
-  addLog("success", "Pengguna baru terdaftar", `User: ${username} (Tier: ${selectedTierId})`);
-  const tier = db.account_tiers.find((t) => t.id === selectedTierId) || db.account_tiers[0];
-
-  res.status(201).json({
-    user: { id: newUser.id, username: newUser.username, tierId: newUser.tierId },
-    tier,
-    token: `session_${crypto.randomBytes(16).toString("hex")}`,
-  });
+  addLog("info", "Pengguna memutuskan akun Google", `User ID: ${userId}`);
+  res.json({ message: "Akun Google berhasil diputuskan." });
 });
+
 
 // 2. Templates Lookup API
 app.get("/api/templates", (req, res) => {
@@ -445,7 +680,7 @@ app.get("/api/notes", (req, res) => {
   res.json(decryptedNotes);
 });
 
-app.post("/api/notes/upload", (req, res) => {
+app.post("/api/notes/upload", async (req, res) => {
   const { userId, title, durationSeconds, audioBase64, templateId, fileName: reqFileName } = req.body;
 
   if (!userId || !title || !audioBase64 || !templateId) {
@@ -481,15 +716,41 @@ app.post("/api/notes/upload", (req, res) => {
     fs.writeFileSync(localFilePath, audioBuffer);
     addLog("info", `File audio tersimpan fisik di server lokal sementara`, `Path: ./uploads/${localFileName} (${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
-    // NFR-02.1 & NFR-02.2: Stream/simulasikan unggah ke Google Drive
-    const gdriveFileId = `gdrive_${noteId}`;
-    const driveFilePath = path.join(GDRIVE_SIM_DIR, `${gdriveFileId}.${audioExt}`);
+    // Check if user has real Google Drive connected
+    db = readDB();
+    const gCurrentUser = db.users.find((u) => u.id === userId);
+    const hasRealGDrive = !!(gCurrentUser?.googleTokens?.access_token);
+    
+    let gdriveFileId = "";
+    let gdriveStorageType = "simulated";
+    
+    if (hasRealGDrive && googleOAuth2Client) {
+      // Real Google Drive upload
+      addLog("info", "Mengunggah ke Google Drive sungguhan untuk user " + (gCurrentUser!.googleEmail || userId) + "...");
+      const mimeType = getMimeType(audioExt);
+      const result = await uploadToGoogleDrive(userId, localFileName, audioBuffer, mimeType);
+      
+      if (result.fileId) {
+        gdriveFileId = result.fileId;
+        gdriveStorageType = "real";
+        addLog("success", "Unggah ke Google Drive sungguhan berhasil!", "File ID: " + gdriveFileId);
+      } else {
+        addLog("warning", "Gagal unggah ke Google Drive sungguhan, fallback ke simulasi", result.error);
+        // Fallback to simulated
+        gdriveFileId = "gdrive_" + noteId;
+        const driveFilePath = path.join(GDRIVE_SIM_DIR, gdriveFileId + "." + audioExt);
+        fs.writeFileSync(driveFilePath, audioBuffer);
+        addLog("success", "Unggah fallback ke simulasi Google Drive berhasil.", "File ID: " + gdriveFileId);
+      }
+    } else {
+      // Simulated Google Drive upload (original behavior)
+      gdriveFileId = "gdrive_" + noteId;
+      const driveFilePath = path.join(GDRIVE_SIM_DIR, gdriveFileId + "." + audioExt);
 
-    addLog("info", `Mulai streaming data dari server lokal ke Google Drive Cloud Storage...`);
-    fs.writeFileSync(driveFilePath, audioBuffer); // simulate successful cloud write
-    addLog("success", `Unggah berhasil! File terverifikasi di Google Drive Cloud Storage.`, `File ID: ${gdriveFileId}`);
-
-    // NFR-02.2: Segera hapus file fisik lokal di server backend setelah verifikasi
+      addLog("info", "Mulai streaming data dari server lokal ke Google Drive Cloud Storage (SIMULASI)...");
+      fs.writeFileSync(driveFilePath, audioBuffer);
+      addLog("success", "Unggah berhasil! File terverifikasi di Google Drive Cloud Storage (SIMULASI).", "File ID: " + gdriveFileId);
+    }// NFR-02.2: Segera hapus file fisik lokal di server backend setelah verifikasi
     if (fs.existsSync(localFilePath)) {
       fs.unlinkSync(localFilePath);
       addLog("success", `NFR-02.2 Clean-Up: Salinan fisik lokal di server backend telah BERHASIL DIHAPUS.`);
@@ -509,6 +770,7 @@ app.post("/api/notes/upload", (req, res) => {
       errorMessage: null,
       createdAt: new Date().toISOString(),
       templateId,
+      gdriveStorageType: gdriveStorageType as any,
     };
 
     db.notes.push(newNote);
@@ -525,6 +787,28 @@ app.post("/api/notes/upload", (req, res) => {
   }
 });
 
+
+// Google Drive User API - List user's Google Drive files
+app.get("/api/drive/files", async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) {
+    return res.status(400).json({ error: "Parameter userId diperlukan" });
+  }
+  
+  db = readDB();
+  const user = db.users.find((u) => u.id === userId);
+  if (!user || !user.googleTokens?.access_token) {
+    return res.json({ files: [], connected: false, message: "Google Drive tidak terhubung" });
+  }
+
+  try {
+    const files = await listGoogleDriveFiles(userId.toString());
+    res.json({ files, connected: true });
+  } catch (err) {
+    res.json({ files: [], connected: false, error: "Gagal mengambil file" });
+  }
+});
+
 // 4. Admin API & Real-time inspector
 app.get("/api/admin/logs", (req, res) => {
 app.get("/api/admin/provider", (_req, res) => {
@@ -537,22 +821,62 @@ app.get("/api/admin/provider", (_req, res) => {
   res.json(logsBuffer);
 });
 
-app.get("/api/admin/gdrive", (req, res) => {
+app.get("/api/admin/gdrive", async (req, res) => {
   try {
-    const files = fs.readdirSync(GDRIVE_SIM_DIR);
-    const result = files.map((file) => {
-      const stat = fs.statSync(path.join(GDRIVE_SIM_DIR, file));
-      return {
-        id: path.basename(file, ".webm"),
-        name: file,
-        sizeBytes: stat.size,
-        uploadedAt: stat.mtime.toISOString(),
-        contentType: "audio/webm",
-      };
+    const { userId } = req.query;
+    let realFiles: any[] = [];
+    let connected = false;
+
+    // Get real Google Drive files if user is connected
+    if (userId) {
+      db = readDB();
+      const user = db.users.find((u) => u.id === userId);
+      if (user?.googleTokens?.access_token) {
+        realFiles = await listGoogleDriveFiles(userId as string);
+        connected = true;
+      }
+    }
+
+    // Get simulated files from local directory
+    const simFiles = [];
+    if (fs.existsSync(GDRIVE_SIM_DIR)) {
+      const files = fs.readdirSync(GDRIVE_SIM_DIR);
+      for (const file of files) {
+        const stat = fs.statSync(path.join(GDRIVE_SIM_DIR, file));
+        simFiles.push({
+          id: path.basename(file, path.extname(file)),
+          name: file,
+          sizeBytes: stat.size,
+          uploadedAt: stat.mtime.toISOString(),
+          contentType: "audio/" + path.extname(file).replace(".", ""),
+          storageType: "simulated",
+        });
+      }
+    }
+
+    // Map real Google Drive files to unified format
+    const mappedReal = realFiles.map((f: any) => ({
+      id: f.id || "",
+      name: f.name || "Unknown",
+      sizeBytes: parseInt(f.size || "0"),
+      uploadedAt: f.modifiedTime || f.createdTime || new Date().toISOString(),
+      contentType: f.mimeType || "audio/webm",
+      storageType: "real",
+    }));
+
+    const allFiles = [...mappedReal, ...simFiles];
+    
+    res.json({
+      files: allFiles,
+      connected,
+      simulatedCount: simFiles.length,
+      realCount: mappedReal.length,
+      storageInfo: connected
+        ? "Menggunakan Google Drive sungguhan"
+        : "Menggunakan penyimpanan simulasi (GOOGLE_CLIENT_ID tidak dikonfigurasi)",
     });
-    res.json(result);
   } catch (err) {
-    res.status(500).json({ error: "Gagal membaca virtual Google Drive." });
+    res.status(500).json({ error: "Gagal membaca Google Drive." });
   }
 });
 
@@ -577,7 +901,30 @@ app.post("/api/admin/clear", (req, res) => {
   }
 });
 
+// Whisper Local STT status endpoint (only available when whisper-local provider is active)
+app.get("/api/admin/whisper", (req, res) => {
+  const status = getWhisperStatus();
+  res.json({
+    available: status.running,
+    port: status.port,
+    pid: status.pid,
+    provider: provider?.getProviderInfo().provider || "none",
+  });
+});
+
 // Configure Vite middleware or static serving
+
+// Cleanup: stop Whisper server on shutdown
+function setupCleanup() {
+  const handleShutdown = () => {
+    addLog("info", "Server menerima sinyal penghentian, membersihkan resource...");
+    stopWhisperServer();
+    process.exit(0);
+  };
+  process.on("SIGINT", handleShutdown);
+  process.on("SIGTERM", handleShutdown);
+}
+
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     addLog("info", "Menjalankan Vite dalam mode Development Middleware...");
@@ -595,9 +942,16 @@ async function startServer() {
     });
   }
 
+  setupCleanup();
   app.listen(PORT, "0.0.0.0", () => {
     addLog("success", `Backend Server berjalan aktif di port http://localhost:${PORT}`);
   });
 }
 
 startServer();
+
+
+
+
+
+

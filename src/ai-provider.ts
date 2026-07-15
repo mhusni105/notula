@@ -1,43 +1,28 @@
-/**
+﻿/**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  * 
- * AI Provider abstraction � supports Gemini, OpenAI, 9router, and Anthropic.
+ * AI Provider abstraction — supports Gemini, OpenAI, 9router, Anthropic, and Whisper Local.
  */
 
 import { GoogleGenAI } from "@google/genai";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-export type AIProviderType = "gemini" | "openai" | "9router" | "anthropic";
+export type AIProviderType = "gemini" | "openai" | "9router" | "anthropic" | "whisper-local";
 
 export interface AIProvider {
-  /** Transcribe an audio file on disk and return the text. */
   transcribeAudio(audioFilePath: string, mimeType: string, signal?: AbortSignal): Promise<string>;
-  /** Generate a summary / structured text from a system prompt and a user prompt. */
   generateSummary(systemPrompt: string, userPrompt: string, signal?: AbortSignal): Promise<string>;
-  /** Human-readable info about the provider and models in use. */
   getProviderInfo(): { provider: AIProviderType; modelSTT: string; modelLLM: string };
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 async function fetchJSON(url: string, options: RequestInit): Promise<any> {
   const res = await fetch(url, options);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status} from ${url}: ${body.slice(0, 300)}`);
+    throw new Error("HTTP " + res.status + " from " + url + ": " + body.slice(0, 300));
   }
   return res.json();
 }
-
-// ---------------------------------------------------------------------------
-// Gemini Provider (uses existing @google/genai SDK)
-// ---------------------------------------------------------------------------
 
 class GeminiProvider implements AIProvider {
   private client: GoogleGenAI;
@@ -83,14 +68,10 @@ class GeminiProvider implements AIProvider {
   }
 }
 
-// ---------------------------------------------------------------------------
-// OpenAI / 9router Provider (OpenAI-compatible REST API)
-// ---------------------------------------------------------------------------
-
 class OpenAIProvider implements AIProvider {
   private apiKey: string;
   private baseURL: string;
-  private sttEndpoint?: string;  // explicit STT endpoint URL, overrides baseURL path
+  private sttEndpoint?: string;
   private modelSTT = "whisper-1";
   private modelLLM = "gpt-4o-mini";
 
@@ -105,24 +86,23 @@ class OpenAIProvider implements AIProvider {
     const fs = await import("fs");
     const audioBuffer = fs.readFileSync(audioFilePath);
 
-    // Build multipart form-data manually (Node 18+ has FormData but needs a Blob/File)
     const blob = new Blob([audioBuffer], { type: _mimeType });
     const formData = new FormData();
     formData.append("file", blob, "audio." + (_mimeType.split("/")[1] || "webm"));
     formData.append("model", this.modelSTT);
     formData.append("response_format", "text");
 
-    const sttUrl = this.sttEndpoint || `${this.baseURL}/audio/transcriptions`;
+    const sttUrl = this.sttEndpoint || (this.baseURL + "/audio/transcriptions");
     const res = await fetch(sttUrl, {
       method: "POST",
-      headers: { Authorization: `Bearer ${this.apiKey}` },
+      headers: { Authorization: "Bearer " + this.apiKey },
       body: formData,
       signal,
     });
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} dari ${sttUrl} — ${body.slice(0, 300)}`);
+      throw new Error("HTTP " + res.status + " dari " + sttUrl + " \u2014 " + body.slice(0, 300));
     }
 
     const text = await res.text();
@@ -138,11 +118,11 @@ class OpenAIProvider implements AIProvider {
       ],
     };
 
-    const data = await fetchJSON(`${this.baseURL}/chat/completions`, {
+    const data = await fetchJSON(this.baseURL + "/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: "Bearer " + this.apiKey,
       },
       body: JSON.stringify(body),
       signal,
@@ -157,10 +137,6 @@ class OpenAIProvider implements AIProvider {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Anthropic Provider
-// ---------------------------------------------------------------------------
-
 class AnthropicProvider implements AIProvider {
   private apiKey: string;
   private modelLLM = "claude-3-5-haiku-latest";
@@ -171,7 +147,6 @@ class AnthropicProvider implements AIProvider {
     if (modelLLM) this.modelLLM = modelLLM;
   }
 
-  // Anthropic does not have a dedicated STT API; fall back to simulation marker
   async transcribeAudio(_audioFilePath: string, _mimeType: string, _signal?: AbortSignal): Promise<string> {
     throw new Error("Anthropic tidak mendukung transkripsi audio langsung. Gunakan Gemini atau OpenAI untuk STT.");
   }
@@ -203,24 +178,63 @@ class AnthropicProvider implements AIProvider {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
+class WhisperLocalProvider implements AIProvider {
+  private modelSTT = "whisper-local";
+  private modelLLM = "(fallback)";
+  private llmProvider: AIProvider | null = null;
 
-/**
- * Creates an AI provider based on environment variables.
- * 
- * | Variable          | Purpose                                          |
- * |-------------------|--------------------------------------------------|
- * | `AI_PROVIDER`     | `gemini` (default), `openai`, `9router`, `anthropic` |
- * | `GEMINI_API_KEY`  | API key for Gemini (used when AI_PROVIDER=gemini) |
- * | `OPENAI_API_KEY`  | API key for OpenAI / 9router                     |
- * | `ANTHROPIC_API_KEY`| API key for Anthropic (Claude)                   |
- * | `AI_BASE_URL`     | Custom base URL (required for 9router, optional for openai) |
- * | `AI_MODEL_STT`    | Override the STT model name                      |
- * | `AI_MODEL_LLM`    | Override the LLM model name                      |
- | `AI_STT_ENDPOINT` | Full URL for STT API (override for proxies/9router) |
- */
+  constructor() {
+    this.llmProvider = this.createLLMProvider();
+  }
+
+  private createLLMProvider(): AIProvider | null {
+    const geminiKey = process.env.GEMINI_API_KEY;
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    const baseURL = process.env.AI_BASE_URL;
+    const modelLLM = process.env.AI_MODEL_LLM;
+
+    if (geminiKey) {
+      const { GoogleGenAI } = require("@google/genai");
+      const client = new GoogleGenAI({ apiKey: geminiKey });
+      return new GeminiProvider(client);
+    }
+    if (openaiKey) {
+      const url = baseURL || "https://api.openai.com/v1";
+      return new OpenAIProvider(openaiKey, url, modelLLM);
+    }
+    if (anthropicKey) {
+      return new AnthropicProvider(anthropicKey, modelLLM);
+    }
+    return null;
+  }
+
+  async transcribeAudio(audioFilePath: string, mimeType: string, signal?: AbortSignal): Promise<string> {
+    const { transcribeWithWhisper } = await import("./whisper-local.js");
+    return transcribeWithWhisper(audioFilePath, mimeType, signal);
+  }
+
+  async generateSummary(systemPrompt: string, userPrompt: string, signal?: AbortSignal): Promise<string> {
+    if (!this.llmProvider) {
+      throw new Error(
+        "Whisper Local hanya menyediakan STT. Untuk ringkasan (LLM), konfigurasikan salah satu API key: " +
+        "GEMINI_API_KEY, OPENAI_API_KEY, atau ANTHROPIC_API_KEY di .env.local"
+      );
+    }
+    this.modelLLM = this.llmProvider.getProviderInfo().modelLLM;
+    return this.llmProvider.generateSummary(systemPrompt, userPrompt, signal);
+  }
+
+  getProviderInfo() {
+    const llmInfo = this.llmProvider?.getProviderInfo();
+    return {
+      provider: "whisper-local" as AIProviderType,
+      modelSTT: this.modelSTT,
+      modelLLM: llmInfo ? (llmInfo.provider + ": " + llmInfo.modelLLM) : "(tidak dikonfigurasi)",
+    };
+  }
+}
+
 export function createProvider(): AIProvider | null {
   const providerType = (process.env.AI_PROVIDER || "gemini") as AIProviderType;
   const modelLLM = process.env.AI_MODEL_LLM;
@@ -251,7 +265,7 @@ export function createProvider(): AIProvider | null {
     case "9router": {
       const key = process.env.OPENAI_API_KEY;
       if (!key) return null;
-      const url = baseURL || "https://api.9router.com/v1";  // sensible default
+      const url = baseURL || "https://api.9router.com/v1";
       return new OpenAIProvider(key, url, modelLLM, sttEndpoint);
     }
 
@@ -259,6 +273,10 @@ export function createProvider(): AIProvider | null {
       const key = process.env.ANTHROPIC_API_KEY;
       if (!key) return null;
       return new AnthropicProvider(key, modelLLM);
+    }
+
+    case "whisper-local": {
+      return new WhisperLocalProvider();
     }
 
     default:

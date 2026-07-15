@@ -46,14 +46,14 @@ export default function App() {
     localStorage.getItem("note_taker_tier") ? JSON.parse(localStorage.getItem("note_taker_tier")!) : null
   );
 
-  // Auth Form State
-  const [isRegisterMode, setIsRegisterMode] = useState(false);
-  const [authUsername, setAuthUsername] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [authTier, setAuthTier] = useState("tier-premium");
+  // Auth Form State - Hanya login dengan Google
   const [authError, setAuthError] = useState("");
-
-  // Notes and Templates
+  const [googleAuthStatus, setGoogleAuthStatus] = useState<{ connected: boolean; email?: string }>(() => {
+    const stored = localStorage.getItem("note_taker_google_status");
+    return stored ? JSON.parse(stored) : { connected: false };
+  });
+  const [googleAuthInProgress, setGoogleAuthInProgress] = useState(false);
+  const [googleDriveConnected, setGoogleDriveConnected] = useState(false);
   const [notes, setNotes] = useState<Note[]>([]);
   const [templates, setTemplates] = useState<NoteTemplate[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
@@ -111,7 +111,7 @@ export default function App() {
     }
     fetchAdminLogs();
     fetchAdminGdrive();
-    fetchAdminDb();
+    // fetchAdminDb();
     fetchAdminProvider();
 
     // Setup polling for notes status, server logs, and virtual drive
@@ -121,11 +121,67 @@ export default function App() {
       }
       fetchAdminLogsSilently();
       fetchAdminGdriveSilently();
-      fetchAdminDbSilently();
+      // fetchAdminDbSilently();
     }, 4000);
 
     return () => clearInterval(interval);
   }, [token, currentUser]);
+
+  // Handle Google OAuth callback from URL params
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const googleAuth = params.get("googleAuth");
+    if (googleAuth === "success") {
+      const token = params.get("token") || "";
+      const userId = params.get("userId") || "";
+      const username = params.get("username") || "";
+      const email = params.get("email") || "";
+      const tierId = params.get("tierId") || "";
+      const tierName = params.get("tierName") || "";
+      const maxDuration = parseInt(params.get("maxDuration") || "600");
+      const authMethod = params.get("authMethod") || "google";
+      const isNew = params.get("isNew") === "true";
+
+      const user = { id: userId, username, email, tierId, authMethod };
+      const tier = { id: tierId, name: tierName, maxDurationSeconds: maxDuration, description: "" };
+
+      localStorage.setItem("note_taker_token", token);
+      localStorage.setItem("note_taker_user", JSON.stringify(user));
+      localStorage.setItem("note_taker_tier", JSON.stringify(tier));
+
+      setToken(token);
+      setCurrentUser(user);
+      setCurrentTier(tier);
+
+      const googleStatus = { connected: true, email };
+      localStorage.setItem("note_taker_google_status", JSON.stringify(googleStatus));
+      setGoogleAuthStatus(googleStatus);
+      setGoogleDriveConnected(true);
+
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (googleAuth === "error") {
+      const message = params.get("message") || "Gagal autentikasi Google";
+      setAuthError(message);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, []);
+
+  // Check Google Drive status when user changes
+  useEffect(() => {
+    if (currentUser?.id) {
+      fetch("/api/auth/google/status?userId=" + currentUser.id)
+        .then((res) => { if (!res.ok) throw new Error(); return res.json(); })
+        .then((data) => {
+          if (data.hasGoogleDrive) {
+            setGoogleDriveConnected(true);
+            const gs = { connected: true, email: data.googleEmail || "" };
+            setGoogleAuthStatus(gs);
+            localStorage.setItem("note_taker_google_status", JSON.stringify(gs));
+          }
+        })
+        .catch(() => { /* ignore */ });
+    }
+  }, [currentUser?.id]);
 
   // Auto scroll server terminal to bottom
   useEffect(() => {
@@ -203,10 +259,12 @@ export default function App() {
 
   const fetchAdminGdrive = async () => {
     try {
-      const res = await fetch("/api/admin/gdrive");
+      const url = currentUser?.id ? "/api/admin/gdrive?userId=" + currentUser.id : "/api/admin/gdrive";
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        setGdriveFiles(data);
+        setGdriveFiles(data.files || data);
+        setGoogleDriveConnected(data.connected || false);
       }
     } catch (err) {
       console.error(err);
@@ -215,34 +273,11 @@ export default function App() {
 
   const fetchAdminGdriveSilently = async () => {
     try {
-      const res = await fetch("/api/admin/gdrive");
+      const url = currentUser?.id ? "/api/admin/gdrive?userId=" + currentUser.id : "/api/admin/gdrive";
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        setGdriveFiles(data);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const fetchAdminDb = async () => {
-    try {
-      const res = await fetch("/api/admin/db");
-      if (res.ok) {
-        const data = await res.json();
-        setRawDb(data);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const fetchAdminDbSilently = async () => {
-    try {
-      const res = await fetch("/api/admin/db");
-      if (res.ok) {
-        const data = await res.json();
-        setRawDb(data);
+        setGdriveFiles(data.files || data);
       }
     } catch (err) {
       console.error(err);
@@ -261,47 +296,6 @@ export default function App() {
     }
   };
 
-  // Auth Operations
-  const handleAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError("");
-    if (!authUsername || !authPassword) {
-      setAuthError("Semua kolom wajib diisi.");
-      return;
-    }
-
-    const endpoint = isRegisterMode ? "/api/auth/register" : "/api/auth/login";
-    const bodyPayload = isRegisterMode
-      ? { username: authUsername, password: authPassword, tierId: authTier }
-      : { username: authUsername, password: authPassword };
-
-    try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(bodyPayload),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        setAuthError(data.error || "Terjadi kesalahan autentikasi.");
-        return;
-      }
-
-      // Save Auth Context
-      localStorage.setItem("note_taker_token", data.token);
-      localStorage.setItem("note_taker_user", JSON.stringify(data.user));
-      localStorage.setItem("note_taker_tier", JSON.stringify(data.tier));
-
-      setToken(data.token);
-      setCurrentUser(data.user);
-      setCurrentTier(data.tier);
-      setAuthUsername("");
-      setAuthPassword("");
-    } catch (err) {
-      setAuthError("Gagal terhubung ke server.");
-    }
-  };
 
   const handleLogout = () => {
     localStorage.removeItem("note_taker_token");
@@ -412,9 +406,9 @@ export default function App() {
         audioCtx.decodeAudioData(buf).then((audioBuf) => {
           setUploadedFileDuration(Math.round(audioBuf.duration));
           audioCtx.close();
-        }).catch(() => { audioCtx.close(); });
-      }).catch(() => { audioCtx.close(); });
-    } catch {}
+        }).catch(() => { /* ignore */ audioCtx.close(); });
+      }).catch(() => { /* ignore */ audioCtx.close(); });
+    } catch { }
 
     setOfflineStatus(`File "${file.name}" berhasil dimuat (${(file.size / 1024).toFixed(1)} KB). Siap diunggah.`);
   };
@@ -524,7 +518,7 @@ export default function App() {
           handleLogout();
           fetchAdminLogs();
           fetchAdminGdrive();
-          fetchAdminDb();
+          // fetchAdminDb();
         }
       } catch (err) {
         alert("Gagal membersihkan data server.");
@@ -607,7 +601,18 @@ export default function App() {
                     {currentUser.username} <span className="font-mono text-[10px] text-indigo-400 font-bold">({currentTier.name.toUpperCase()})</span>
                   </p>
                   <p className="text-[10px] text-[#A1A1AA]">
-                    Maks: {currentTier.maxDurationSeconds / 60} menit / sesi
+                    {googleDriveConnected && (
+                      <span className="inline-flex items-center gap-1 text-emerald-500 font-mono text-[10px]">
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                        Google Drive Terhubung
+                      </span>
+                    )}
+                    {currentUser?.authMethod === "google" && !googleDriveConnected && (
+                      <span className="inline-flex items-center gap-1 text-amber-500 font-mono text-[10px]">
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-500"></span>
+                        Akun Google ({currentUser.email || currentUser.username})
+                      </span>
+                    )}
                   </p>
                 </div>
                 <button
@@ -644,15 +649,15 @@ export default function App() {
             {/* Mobile App Viewport */}
             <div className="flex-1 p-5 overflow-y-auto flex flex-col bg-[#0A0A0B]">
               {!token ? (
-                /* AUTH VIEW */
+                /* AUTH VIEW - Google Only */
                 <div className="my-auto max-w-md w-full mx-auto bg-[#18181B] p-6 rounded-sm border border-[#262626]">
                   <div className="text-center mb-6">
                     <span className="inline-flex bg-indigo-950/50 border border-indigo-900/30 p-3 rounded-sm text-indigo-400 mb-2">
                       <Mic className="w-8 h-8" />
                     </span>
-                    <h2 className="text-base font-black uppercase tracking-tight font-display text-[#E0E0E0]">Selamat Datang di NoteSync</h2>
+                    <h2 className="text-base font-black uppercase tracking-tight font-display text-[#E0E0E0]">Selamat Datang di Notula</h2>
                     <p className="text-xs text-[#A1A1AA] mt-1">
-                      Silakan masuk atau daftar untuk mensinkronisasi rekaman Anda.
+                      Silakan masuk dengan Google untuk mulai merekam dan menyinkronkan catatan Anda.
                     </p>
                   </div>
 
@@ -663,67 +668,29 @@ export default function App() {
                     </div>
                   )}
 
-                  <form onSubmit={handleAuth} className="space-y-4">
-                    <div>
-                      <label className="block text-[10px] font-bold uppercase tracking-wider text-[#A1A1AA] mb-1">Username</label>
-                      <input
-                        type="text"
-                        value={authUsername}
-                        onChange={(e) => setAuthUsername(e.target.value)}
-                        className="w-full px-3 py-2 text-sm border border-[#262626] rounded-sm focus:outline-hidden focus:border-indigo-500 bg-[#0F0F10] text-[#E0E0E0]"
-                        placeholder="Masukkan username"
-                      />
-                    </div>
+                  {/* Google Sign-In Button */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGoogleAuthInProgress(true);
+                      window.location.href = "/api/auth/google";
+                    }}
+                    disabled={googleAuthInProgress}
+                    className="w-full flex items-center justify-center gap-2 bg-white hover:bg-gray-100 text-gray-800 font-medium py-3 px-4 rounded-sm text-sm transition-all cursor-pointer disabled:opacity-50"
+                  >
+                    <svg className="w-5 h-5" viewBox="0 0 24 24">
+                      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" />
+                      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+                      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+                    </svg>
+                    {googleAuthInProgress ? "Mengarahkan ke Google..." : "Masuk dengan Google"}
+                  </button>
 
-                    <div>
-                      <label className="block text-[10px] font-bold uppercase tracking-wider text-[#A1A1AA] mb-1">Password</label>
-                      <input
-                        type="password"
-                        value={authPassword}
-                        onChange={(e) => setAuthPassword(e.target.value)}
-                        className="w-full px-3 py-2 text-sm border border-[#262626] rounded-sm focus:outline-hidden focus:border-indigo-500 bg-[#0F0F10] text-[#E0E0E0]"
-                        placeholder="Masukkan password"
-                      />
-                    </div>
-
-                    {isRegisterMode && (
-                      <div>
-                        <label className="block text-[10px] font-bold uppercase tracking-wider text-[#A1A1AA] mb-1">Account Tier</label>
-                        <select
-                          value={authTier}
-                          onChange={(e) => setAuthTier(e.target.value)}
-                          className="w-full px-3 py-2 text-sm border border-[#262626] rounded-sm bg-[#0F0F10] text-[#E0E0E0] focus:outline-hidden focus:border-indigo-500"
-                        >
-                          <option value="tier-free" className="bg-[#0F0F10]">Free Tier (Maks. 10 Menit)</option>
-                          <option value="tier-premium" className="bg-[#0F0F10]">Premium Tier (Maks. 1 Jam)</option>
-                        </select>
-                        <p className="text-[10px] text-[#71717A] mt-1 leading-normal font-mono">
-                          Tier akun tersimpan di lookup table database relasional secara dinamis.
-                        </p>
-                      </div>
-                    )}
-
-                    <button
-                      type="submit"
-                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold uppercase tracking-widest py-2.5 px-4 rounded-sm text-xs transition-all cursor-pointer"
-                    >
-                      {isRegisterMode ? "Daftar Akun Baru" : "Masuk"}
-                    </button>
-                  </form>
-
-                  <div className="mt-4 text-center">
-                    <button
-                      onClick={() => {
-                        setIsRegisterMode(!isRegisterMode);
-                        setAuthError("");
-                      }}
-                      className="text-xs text-indigo-400 hover:underline font-bold uppercase tracking-wider cursor-pointer"
-                    >
-                      {isRegisterMode ? "Sudah punya akun? Masuk di sini" : "Belum punya akun? Daftar di sini"}
-                    </button>
-                  </div>
-                </div>
-              ) : (
+                  <p className="text-[10px] text-[#71717A] mt-4 text-center leading-relaxed font-mono">
+                    Dengan masuk, Anda menyetujui penggunaan data Google Anda untuk autentikasi dan penyimpanan file audio ke Google Drive.
+                  </p>
+                </div>) : (
                 /* MAIN APP RECORDR & LIST */
                 <div className="flex flex-col gap-5 flex-1">
                   {/* APP TITLE / SEARCH BAR */}
@@ -754,11 +721,10 @@ export default function App() {
                           setUploadedFileDuration(0);
                           setOfflineStatus(null);
                         }}
-                        className={`flex-1 text-[10px] font-bold uppercase tracking-wider py-1.5 px-2 rounded-sm transition-all cursor-pointer ${
-                          inputMode === "record"
+                        className={`flex-1 text-[10px] font-bold uppercase tracking-wider py-1.5 px-2 rounded-sm transition-all cursor-pointer ${inputMode === "record"
                             ? "bg-indigo-600 text-white"
                             : "text-[#71717A] hover:text-[#E0E0E0]"
-                        }`}
+                          }`}
                       >
                         <Mic className="w-3 h-3 inline-block mr-1" />
                         Rekam Audio
@@ -769,11 +735,10 @@ export default function App() {
                           if (isRecording) stopRecording();
                           setOfflineStatus(null);
                         }}
-                        className={`flex-1 text-[10px] font-bold uppercase tracking-wider py-1.5 px-2 rounded-sm transition-all cursor-pointer ${
-                          inputMode === "upload"
+                        className={`flex-1 text-[10px] font-bold uppercase tracking-wider py-1.5 px-2 rounded-sm transition-all cursor-pointer ${inputMode === "upload"
                             ? "bg-indigo-600 text-white"
                             : "text-[#71717A] hover:text-[#E0E0E0]"
-                        }`}
+                          }`}
                       >
                         <Upload className="w-3 h-3 inline-block mr-1" />
                         Unggah File
@@ -793,11 +758,10 @@ export default function App() {
                           )}
                           <button
                             onClick={isRecording ? stopRecording : startRecording}
-                            className={`w-16 h-16 rounded-sm flex items-center justify-center text-white transition-all cursor-pointer ${
-                              isRecording
+                            className={`w-16 h-16 rounded-sm flex items-center justify-center text-white transition-all cursor-pointer ${isRecording
                                 ? "bg-rose-600 hover:bg-rose-700"
                                 : "bg-indigo-600 hover:bg-indigo-700"
-                            }`}
+                              }`}
                           >
                             {isRecording ? <Square className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
                           </button>
@@ -953,9 +917,8 @@ export default function App() {
                               {/* Accordion Trigger */}
                               <div
                                 onClick={() => setExpandedNoteId(isExpanded ? null : note.id)}
-                                className={`p-3.5 flex items-start justify-between gap-3 cursor-pointer select-none transition-colors ${
-                                  isExpanded ? "border-l-2 border-indigo-500 bg-[#0F0F10]" : ""
-                                }`}
+                                className={`p-3.5 flex items-start justify-between gap-3 cursor-pointer select-none transition-colors ${isExpanded ? "border-l-2 border-indigo-500 bg-[#0F0F10]" : ""
+                                  }`}
                               >
                                 <div className="space-y-1">
                                   <h5 className="text-xs font-bold text-[#E0E0E0]">{note.title}</h5>
@@ -995,7 +958,7 @@ export default function App() {
                                           <span>Cloud Storage: </span>
                                         </div>
                                         <span className="font-semibold text-[#E0E0E0] bg-[#0F0F10] border border-[#262626] px-2 py-0.5 rounded-sm">
-                                          Google Drive (ID: {note.gdriveFileId || "Failed"})
+                                          Google Drive {note.gdriveStorageType === "real" ? "(Real)" : "(Simulasi)"} (ID: {note.gdriveFileId || "Failed"})
                                         </span>
                                       </div>
 
@@ -1040,16 +1003,16 @@ export default function App() {
                                       {(note.status === ProcessStatus.UPLOADING ||
                                         note.status === ProcessStatus.TRANSCRIBING ||
                                         note.status === ProcessStatus.SUMMARIZING) && (
-                                        <div className="py-6 text-center text-[#A1A1AA] space-y-2">
-                                          <RefreshCw className="w-6 h-6 text-indigo-400 animate-spin mx-auto" />
-                                          <p className="font-bold uppercase tracking-wider text-[11px]">
-                                            Sistem AI sedang memproses berkas audio Anda...
-                                          </p>
-                                          <p className="text-[10px] text-[#71717A] font-mono">
-                                            Fase: {note.status}. Mengambil transkripsi &amp; menyusun ringkasan rapat.
-                                          </p>
-                                        </div>
-                                      )}
+                                          <div className="py-6 text-center text-[#A1A1AA] space-y-2">
+                                            <RefreshCw className="w-6 h-6 text-indigo-400 animate-spin mx-auto" />
+                                            <p className="font-bold uppercase tracking-wider text-[11px]">
+                                              Sistem AI sedang memproses berkas audio Anda...
+                                            </p>
+                                            <p className="text-[10px] text-[#71717A] font-mono">
+                                              Fase: {note.status}. Mengambil transkripsi &amp; menyusun ringkasan rapat.
+                                            </p>
+                                          </div>
+                                        )}
 
                                       {/* IF FAILED */}
                                       {note.status === ProcessStatus.FAILED && (
@@ -1228,76 +1191,72 @@ export default function App() {
               <div className="flex items-center gap-1.5 bg-[#18181B] p-1 rounded-sm border border-[#262626] self-start">
                 <button
                   onClick={() => setAdminTab("logs")}
-                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${
-                    adminTab === "logs" ? "bg-[#262626] text-emerald-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
-                  }`}
+                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${adminTab === "logs" ? "bg-[#262626] text-emerald-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
+                    }`}
                 >
                   <Terminal className="w-3 h-3" /> Server Logs
                 </button>
                 <button
                   onClick={() => setAdminTab("gdrive")}
-                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${
-                    adminTab === "gdrive" ? "bg-[#262626] text-cyan-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
-                  }`}
+                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${adminTab === "gdrive" ? "bg-[#262626] text-cyan-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
+                    }`}
                 >
                   <HardDrive className="w-3 h-3" /> G-Drive Storage
                 </button>
                 <button
                   onClick={() => setAdminTab("database")}
-                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${
-                    adminTab === "database" ? "bg-[#262626] text-amber-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
-                  }`}
+                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${adminTab === "database" ? "bg-[#262626] text-amber-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
+                    }`}
                 >
                   <Database className="w-3 h-3" /> Relational DB
                 </button>
                 <button
                   onClick={() => setAdminTab("provider")}
-                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${
-                  adminTab === "provider" && (
-                <div className="space-y-3">
-                  <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">Konfigurasi AI Provider</h4>
-                  <div className="bg-[#18181B] border border-[#262626] rounded-sm p-4 space-y-3">
-                    {adminProviderInfo ? (
-                      <>
-                        <div className="flex items-center justify-between">
-                          <span className="text-[10px] uppercase tracking-wider text-[#71717A] font-mono">Provider Aktif</span>
-                          <span className="text-xs font-bold text-purple-400 uppercase tracking-wider bg-purple-950/30 border border-purple-900/40 px-2 py-0.5 rounded-sm">
-                            {adminProviderInfo.provider === "none" ? "Tidak Ada (Simulasi)" : adminProviderInfo.provider}
-                          </span>
+                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-all flex items-center gap-1 cursor-pointer ${adminTab === "provider" && (
+                      <div className="space-y-3">
+                        <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">Konfigurasi AI Provider</h4>
+                        <div className="bg-[#18181B] border border-[#262626] rounded-sm p-4 space-y-3">
+                          {adminProviderInfo ? (
+                            <>
+                              <div className="flex items-center justify-between">
+                                <span className="text-[10px] uppercase tracking-wider text-[#71717A] font-mono">Provider Aktif</span>
+                                <span className="text-xs font-bold text-purple-400 uppercase tracking-wider bg-purple-950/30 border border-purple-900/40 px-2 py-0.5 rounded-sm">
+                                  {adminProviderInfo.provider === "none" ? "Tidak Ada (Simulasi)" : adminProviderInfo.provider}
+                                </span>
+                              </div>
+                              <div className="border-t border-[#262626] pt-2 space-y-2">
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="text-[#71717A]">Model STT</span>
+                                  <span className="text-[#E0E0E0] font-mono">{adminProviderInfo.modelSTT}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="text-[#71717A]">Model LLM</span>
+                                  <span className="text-[#E0E0E0] font-mono">{adminProviderInfo.modelLLM}</span>
+                                </div>
+                              </div>
+                              <div className="border-t border-[#262626] pt-2 text-[10px] text-[#535358] font-sans leading-relaxed">
+                                {adminProviderInfo.provider === "gemini" && "Menggunakan Google Gemini API untuk STT (audio-to-text) dan LLM (ranguman)."}
+                                {adminProviderInfo.provider === "openai" && "Menggunakan OpenAI API: Whisper untuk STT dan GPT untuk rangkuman."}
+                                {adminProviderInfo.provider === "9router" && "Menggunakan 9router (OpenAI-compatible) sebagai proxy AI."}
+                                {adminProviderInfo.provider === "anthropic" && "Menggunakan Anthropic Claude untuk LLM (rangkuman). STT tidak didukung - menggunakan simulasi."}
+                                {adminProviderInfo.provider === "none" && "Tidak ada API key terdeteksi. Sistem berjalan dalam mode simulasi."}
+                              </div>
+                            </>
+                          ) : (
+                            <p className="text-[11px] text-[#71717A] font-mono">Memuat informasi provider...</p>
+                          )}
                         </div>
-                        <div className="border-t border-[#262626] pt-2 space-y-2">
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span className="text-[#71717A]">Model STT</span>
-                            <span className="text-[#E0E0E0] font-mono">{adminProviderInfo.modelSTT}</span>
-                          </div>
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span className="text-[#71717A]">Model LLM</span>
-                            <span className="text-[#E0E0E0] font-mono">{adminProviderInfo.modelLLM}</span>
-                          </div>
-                        </div>
-                        <div className="border-t border-[#262626] pt-2 text-[10px] text-[#535358] font-sans leading-relaxed">
-                          {adminProviderInfo.provider === "gemini" && "Menggunakan Google Gemini API untuk STT (audio-to-text) dan LLM (ranguman)."}
-                          {adminProviderInfo.provider === "openai" && "Menggunakan OpenAI API: Whisper untuk STT dan GPT untuk rangkuman."}
-                          {adminProviderInfo.provider === "9router" && "Menggunakan 9router (OpenAI-compatible) sebagai proxy AI."}
-                          {adminProviderInfo.provider === "anthropic" && "Menggunakan Anthropic Claude untuk LLM (rangkuman). STT tidak didukung - menggunakan simulasi."}
-                          {adminProviderInfo.provider === "none" && "Tidak ada API key terdeteksi. Sistem berjalan dalam mode simulasi."}
-                        </div>
-                      </>
-                    ) : (
-                      <p className="text-[11px] text-[#71717A] font-mono">Memuat informasi provider...</p>
+                        <p className="text-[10px] text-[#535358] font-mono leading-relaxed">
+                          Atur provider AI melalui file <span className="text-indigo-400">.env.local</span>.
+                          Variable: <span className="text-indigo-400">AI_PROVIDER</span> (gemini, openai, 9router, anthropic),
+                          <span className="text-indigo-400"> GEMINI_API_KEY</span>,
+                          <span className="text-indigo-400"> OPENAI_API_KEY</span>,
+                          <span className="text-indigo-400"> ANTHROPIC_API_KEY</span>,
+                          <span className="text-indigo-400"> AI_BASE_URL</span> (khusus 9router),
+                          <span className="text-indigo-400"> AI_MODEL_LLM</span>.
+                        </p>
+                      </div>
                     )}
-                  </div>
-                  <p className="text-[10px] text-[#535358] font-mono leading-relaxed">
-                    Atur provider AI melalui file <span className="text-indigo-400">.env.local</span>. 
-                    Variable: <span className="text-indigo-400">AI_PROVIDER</span> (gemini, openai, 9router, anthropic), 
-                    <span className="text-indigo-400"> GEMINI_API_KEY</span>, 
-                    <span className="text-indigo-400"> OPENAI_API_KEY</span>, 
-                    <span className="text-indigo-400"> ANTHROPIC_API_KEY</span>, 
-                    <span className="text-indigo-400"> AI_BASE_URL</span> (khusus 9router), 
-                    <span className="text-indigo-400"> AI_MODEL_LLM</span>.
-                  </p>
-                </div>
-              )}
                     adminTab === "provider" ? "bg-[#262626] text-purple-400 font-bold border border-[#3F3F46]" : "text-[#A1A1AA] hover:text-[#E0E0E0]"
                   }`}
                 >
@@ -1347,10 +1306,10 @@ export default function App() {
                   <div className="bg-[#18181B] p-3.5 border border-[#262626] rounded-sm space-y-2">
                     <div className="flex items-center justify-between text-cyan-400 font-bold uppercase tracking-wider">
                       <span className="flex items-center gap-1.5">
-                        <HardDrive className="w-4 h-4" /> Penyimpanan Cloud Google Drive (Simulasi Awan API)
+                        <HardDrive className="w-4 h-4" /> Penyimpanan Cloud Google Drive
                       </span>
                       <span className="text-[10px] bg-cyan-950/50 text-cyan-400 border border-cyan-900/40 px-2 py-0.5 rounded-sm">
-                        Uptime: 100%
+                        {googleDriveConnected ? "Connected (Real)" : "Simulasi"}
                       </span>
                     </div>
                     <p className="text-[11px] text-[#A1A1AA] leading-relaxed font-sans">
@@ -1376,158 +1335,159 @@ export default function App() {
                       <div className="bg-[#0A0A0B] p-3 rounded-sm border border-[#262626]">
                         <h4 className="text-[10px] uppercase font-bold tracking-wider text-[#71717A]">Penyimpanan Google Drive</h4>
                         <div className="flex items-center gap-3 mt-1.5">
-                          <div className="bg-cyan-950/40 text-cyan-400 p-1.5 rounded-sm border border-cyan-900/40 font-sans">
-                            <HardDrive className="w-4 h-4 animate-pulse" />
+                          <div className={"p-1.5 rounded-sm border font-sans " + (googleDriveConnected ? "bg-emerald-950/40 text-emerald-400 border-emerald-900/40" : "bg-cyan-950/40 text-cyan-400 border-cyan-900/40")}>
+                            <HardDrive className="w-4 h-4" />
                           </div>
                           <div className="text-[11px]">
-                            <p className="font-semibold text-cyan-300">
+                            <p className={"font-semibold " + (googleDriveConnected ? "text-emerald-300" : "text-cyan-300")}>
                               {gdriveFiles.length} Files / {(gdriveFiles.reduce((acc, f) => acc + f.sizeBytes, 0) / 1024 / 1024).toFixed(2)} MB
                             </p>
                             <p className="text-[10px] text-[#71717A] font-sans leading-none mt-0.5">
-                              Google Drive Cloud Storage: Terhubung
+                              {googleDriveConnected ? "Google Drive Real: Connected" : "Penyimpanan Simulasi"}
                             </p>
                           </div>
                         </div>
                       </div>
                     </div>
                   </div>
-
-                  <div className="space-y-2">
-                    <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">
-                      Daftar Berkas Cloud Storage (Google Drive Explorer)
-                    </h4>
-                    <div className="bg-[#18181B] rounded-sm border border-[#262626] overflow-hidden">
-                      <table className="w-full text-[11px] font-mono border-collapse text-left">
-                        <thead>
-                          <tr className="bg-[#0F0F10] border-b border-[#262626] text-[#A1A1AA] font-bold uppercase tracking-wider">
-                            <th className="p-3">File ID</th>
-                            <th className="p-3">Nama Berkas</th>
-                            <th className="p-3">Ukuran</th>
-                            <th className="p-3">Tanggal Unggah</th>
-                            <th className="p-3 text-right">Status</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {gdriveFiles.length === 0 ? (
-                            <tr>
-                              <td colSpan={5} className="p-8 text-center text-[#71717A] text-[11px] uppercase tracking-wider">
-                                Tidak ada berkas di Google Drive. Silakan rekam dan unggah audio dari mobile client simulator.
-                              </td>
-                            </tr>
-                          ) : (
-                            gdriveFiles.map((file) => (
-                              <tr key={file.id} className="border-b border-[#262626] hover:bg-[#0A0A0B]/60 transition-colors">
-                                <td className="p-3 text-cyan-400 font-bold">{file.id}</td>
-                                <td className="p-3 text-[#E0E0E0]">{file.name}</td>
-                                <td className="p-3 text-[#A1A1AA]">{(file.sizeBytes / 1024).toFixed(1)} KB</td>
-                                <td className="p-3 text-[#71717A]">{new Date(file.uploadedAt).toLocaleString()}</td>
-                                <td className="p-3 text-right">
-                                  <span className="bg-cyan-950/40 text-cyan-400 border border-cyan-900/40 px-2 py-0.5 rounded-sm text-[10px] font-bold uppercase tracking-wider">
-                                    Verified Cloud
-                                  </span>
-                                </td>
-                              </tr>
-                            ))
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
                 </div>
-              )}
+                  )}    </div>
 
-              {/* TAB 3: SECURE RELATIONAL DB INSPECTOR (NFR-03.2 ENCRYPTION) */}
-              {adminTab === "database" && (
-                <div className="space-y-4">
-                  <div className="bg-[#18181B] p-3.5 border border-[#262626] rounded-sm space-y-2">
-                    <div className="flex items-center justify-between text-amber-400 font-bold uppercase tracking-wider">
-                      <span className="flex items-center gap-1.5">
-                        <Database className="w-4 h-4" /> Inspektur Database Enkripsi Tingkat Aplikasi (NFR-03.2)
-                      </span>
-                      <button
-                        onClick={() => setDecryptAdminDb(!decryptAdminDb)}
-                        className={`px-2.5 py-1 text-[10px] font-mono rounded-sm border transition-all cursor-pointer flex items-center gap-1 ${
-                          decryptAdminDb
-                            ? "bg-emerald-950/40 text-emerald-400 border-emerald-900/40"
-                            : "bg-amber-950/40 text-amber-400 border-amber-900/40 animate-pulse"
-                        }`}
-                      >
-                        {decryptAdminDb ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
-                        {decryptAdminDb ? "TUTUP DEKRIPSI" : "DEKRIPSI CIPHERTEXT DI DB"}
-                      </button>
-                    </div>
-                    <p className="text-[11px] text-[#A1A1AA] leading-relaxed font-sans">
-                      Aturan **NFR-03.2** menyatakan bahwa data teks sensitif (transkripsi verbatim dan rangkuman) **wajib dienkripsi di tingkat aplikasi (AES-256-CBC) sebelum disimpan ke dalam database**. Ini memastikan privasi data tetap terjaga meskipun file database dibobol atau diakses langsung.
-                    </p>
-                  </div>
-
-                  {/* SHOW NOTES DB TABLE */}
-                  <div className="space-y-2">
-                    <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">
-                      Tabel operasional: {"`notes`"} di Database (Look-inside)
-                    </h4>
-                    <div className="bg-[#18181B] rounded-sm border border-[#262626] overflow-x-auto">
-                      <table className="w-full text-[10px] font-mono border-collapse text-left min-w-[600px]">
-                        <thead>
-                          <tr className="bg-[#0F0F10] border-b border-[#262626] text-[#A1A1AA] font-bold uppercase tracking-wider">
-                            <th className="p-3">id</th>
-                            <th className="p-3">title</th>
-                            <th className="p-3">templateId</th>
-                            <th className="p-3">transcription (Verbatim)</th>
-                            <th className="p-3">summary &amp; action_items</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {!rawDb || rawDb.notes.length === 0 ? (
-                            <tr>
-                              <td colSpan={5} className="p-8 text-center text-[#71717A] uppercase tracking-wider">
-                                Database kosong. Harap buat rekaman baru di mobile client simulator.
-                              </td>
-                            </tr>
-                          ) : (
-                            rawDb.notes.map((n: any) => (
-                              <tr key={n.id} className="border-b border-[#262626] hover:bg-[#0A0A0B]/60 transition-colors font-mono align-top">
-                                <td className="p-3 text-indigo-400 font-bold">{n.id}</td>
-                                <td className="p-3 text-[#E0E0E0] font-sans">{n.title}</td>
-                                <td className="p-3 text-[#A1A1AA]">{n.templateId}</td>
-                                <td className="p-3 max-w-[200px] truncate-text">
-                                  <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
-                                    {n.transcriptionEncrypted || "NULL"}
-                                  </span>
-                                </td>
-                                <td className="p-3 max-w-[200px] truncate-text">
-                                  <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
-                                    {n.summaryEncrypted || "NULL"}
-                                  </span>
-                                </td>
-                              </tr>
-                            ))
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </div>
-              )}
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">
+                Daftar Berkas Cloud Storage (Google Drive Explorer)
+              </h4>
+              <div className="bg-[#18181B] rounded-sm border border-[#262626] overflow-hidden">
+                <table className="w-full text-[11px] font-mono border-collapse text-left">
+                  <thead>
+                    <tr className="bg-[#0F0F10] border-b border-[#262626] text-[#A1A1AA] font-bold uppercase tracking-wider">
+                      <th className="p-3">File ID</th>
+                      <th className="p-3">Nama Berkas</th>
+                      <th className="p-3">Ukuran</th>
+                      <th className="p-3">Tanggal Unggah</th>
+                      <th className="p-3 text-right">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {gdriveFiles.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="p-8 text-center text-[#71717A] text-[11px] uppercase tracking-wider">
+                          Tidak ada berkas di Google Drive. Silakan rekam dan unggah audio dari mobile client simulator.
+                        </td>
+                      </tr>
+                    ) : (
+                      gdriveFiles.map((file) => (
+                        <tr key={file.id} className="border-b border-[#262626] hover:bg-[#0A0A0B]/60 transition-colors">
+                          <td className="p-3 text-cyan-400 font-bold">{file.id}</td>
+                          <td className="p-3 text-[#E0E0E0]">{file.name}</td>
+                          <td className="p-3 text-[#A1A1AA]">{(file.sizeBytes / 1024).toFixed(1)} KB</td>
+                          <td className="p-3 text-[#71717A]">{new Date(file.uploadedAt).toLocaleString()}</td>
+                          <td className="p-3 text-right">
+                            <span className="bg-cyan-950/40 text-cyan-400 border border-cyan-900/40 px-2 py-0.5 rounded-sm text-[10px] font-bold uppercase tracking-wider">
+                              {file.storageType === "real" ? "Google Drive" : "Simulasi"}
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
-        </section>
-      </main>
 
-      {/* FOOTER */}
-      <footer className="bg-[#0F0F10] border-t border-[#262626] py-4 px-6 text-center text-xs text-[#71717A] font-sans mt-auto">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:justify-between items-center gap-2">
-          <p>© 2026 NoteSync. Semua hak dilindungi.</p>
-          <div className="flex items-center gap-4 font-mono text-[10px] uppercase tracking-wider">
-            <span className="flex items-center gap-1.5 text-emerald-500">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-ping"></span>
-              Secure AES-256 Encryption Active
-            </span>
-            <span>|</span>
-            <span>Vite + Express Container Active</span>
-          </div>
+          {/* TAB 3: SECURE RELATIONAL DB INSPECTOR (NFR-03.2 ENCRYPTION) */}
+          {adminTab === "database" && (
+            <div className="space-y-4">
+              <div className="bg-[#18181B] p-3.5 border border-[#262626] rounded-sm space-y-2">
+                <div className="flex items-center justify-between text-amber-400 font-bold uppercase tracking-wider">
+                  <span className="flex items-center gap-1.5">
+                    <Database className="w-4 h-4" /> Inspektur Database Enkripsi Tingkat Aplikasi (NFR-03.2)
+                  </span>
+                  <button
+                    onClick={() => setDecryptAdminDb(!decryptAdminDb)}
+                    className={`px-2.5 py-1 text-[10px] font-mono rounded-sm border transition-all cursor-pointer flex items-center gap-1 ${decryptAdminDb
+                        ? "bg-emerald-950/40 text-emerald-400 border-emerald-900/40"
+                        : "bg-amber-950/40 text-amber-400 border-amber-900/40 animate-pulse"
+                      }`}
+                  >
+                    {decryptAdminDb ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+                    {decryptAdminDb ? "TUTUP DEKRIPSI" : "DEKRIPSI CIPHERTEXT DI DB"}
+                  </button>
+                </div>
+                <p className="text-[11px] text-[#A1A1AA] leading-relaxed font-sans">
+                  Aturan **NFR-03.2** menyatakan bahwa data teks sensitif (transkripsi verbatim dan rangkuman) **wajib dienkripsi di tingkat aplikasi (AES-256-CBC) sebelum disimpan ke dalam database**. Ini memastikan privasi data tetap terjaga meskipun file database dibobol atau diakses langsung.
+                </p>
+              </div>
+
+              {/* SHOW NOTES DB TABLE */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider">
+                  Tabel operasional: {"`notes`"} di Database (Look-inside)
+                </h4>
+                <div className="bg-[#18181B] rounded-sm border border-[#262626] overflow-x-auto">
+                  <table className="w-full text-[10px] font-mono border-collapse text-left min-w-[600px]">
+                    <thead>
+                      <tr className="bg-[#0F0F10] border-b border-[#262626] text-[#A1A1AA] font-bold uppercase tracking-wider">
+                        <th className="p-3">id</th>
+                        <th className="p-3">title</th>
+                        <th className="p-3">templateId</th>
+                        <th className="p-3">transcription (Verbatim)</th>
+                        <th className="p-3">summary &amp; action_items</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {!rawDb || rawDb.notes.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="p-8 text-center text-[#71717A] uppercase tracking-wider">
+                            Database kosong. Harap buat rekaman baru di mobile client simulator.
+                          </td>
+                        </tr>
+                      ) : (
+                        rawDb.notes.map((n: any) => (
+                          <tr key={n.id} className="border-b border-[#262626] hover:bg-[#0A0A0B]/60 transition-colors font-mono align-top">
+                            <td className="p-3 text-indigo-400 font-bold">{n.id}</td>
+                            <td className="p-3 text-[#E0E0E0] font-sans">{n.title}</td>
+                            <td className="p-3 text-[#A1A1AA]">{n.templateId}</td>
+                            <td className="p-3 max-w-[200px] truncate-text">
+                              <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
+                                {n.transcriptionEncrypted || "NULL"}
+                              </span>
+                            </td>
+                            <td className="p-3 max-w-[200px] truncate-text">
+                              <span className="text-amber-500 font-mono text-[9px] break-all block max-h-16 overflow-y-auto">
+                                {n.summaryEncrypted || "NULL"}
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+        </section >
+      </main >
+
+    {/* FOOTER */ }
+    < footer className = "bg-[#0F0F10] border-t border-[#262626] py-4 px-6 text-center text-xs text-[#71717A] font-sans mt-auto" >
+      <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:justify-between items-center gap-2">
+        <p>© 2026 NoteSync. Semua hak dilindungi.</p>
+        <div className="flex items-center gap-4 font-mono text-[10px] uppercase tracking-wider">
+          <span className="flex items-center gap-1.5 text-emerald-500">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-ping"></span>
+            Secure AES-256 Encryption Active
+          </span>
+          <span>|</span>
+          <span>Vite + Express Container Active</span>
         </div>
-      </footer>
-    </div>
+      </div>
+      </footer >
+    </div >
   );
 }
+
+
+
