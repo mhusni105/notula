@@ -5,8 +5,6 @@ coverage/
 .DS_Store
 *.log
 .env*
-!.env.example
 !.env.local
-.env.example
 .env.local
 google_drive_sim/
