@@ -1,0 +1,38 @@
+{
+  "account_tiers": [
+    {
+      "id": "tier-free",
+      "name": "Free Tier",
+      "maxDurationSeconds": 600,
+      "description": "Maksimal durasi perekaman 10 menit per sesi (uji coba)."
+    },
+    {
+      "id": "tier-premium",
+      "name": "Premium Tier",
+      "maxDurationSeconds": 3600,
+      "description": "Maksimal durasi perekaman 1 jam per sesi (Sesuai FR-02.2)."
+    }
+  ],
+  "users": [
+    
+  ],
+  "templates": [
+    {
+      "id": "tpl-rapat-proyek",
+      "name": "Rapat Proyek",
+      "description": "Template standar untuk rapat proyek, menghasilkan Ringkasan Eksekutif dan Daftar Tindakan (Action Items).",
+      "systemPrompt": "Anda adalah asisten pencatat rapat proyek AI. Tugas Anda adalah merangkum transkripsi audio rapat proyek dengan mematuhi format yang ditentukan. Respons harus dalam Bahasa Indonesia yang formal dan terstruktur.",
+      "userPromptTemplate": "Rangkum rapat proyek berikut berdasarkan transkripsi yang ada:\n\n### RINGKASAN EKSEKUTIF\n[Tuliskan 2-3 paragraf ringkasan jalannya diskusi, keputusan penting, dan agenda utama rapat]\n\n### DAFTAR TINDAKAN (ACTION ITEMS)\n- [Nama PIC]: [Tugas / tindakan konkret yang harus diselesaikan]\n- [Nama PIC]: [Tugas / tindakan konkret yang harus diselesaikan]\n\nTranskripsi Audio:\n{{TRANSCRIPTION}}"
+    },
+    {
+      "id": "tpl-rapat-proyek-en-to-id",
+      "name": "Rapat Proyek (Transkripsi Inggris -> Ringkasan Indo)",
+      "description": "Template untuk rapat proyek dengan transkripsi Bahasa Inggris, menghasilkan Ringkasan Eksekutif dan Daftar Tindakan (Action Items) dalam Bahasa Indonesia.",
+      "systemPrompt": "Anda adalah asisten pencatat rapat proyek AI lintas bahasa yang ahli. Tugas Anda adalah menganalisis transkripsi audio rapat proyek yang berbahasa Inggris, lalu menerjemahkan esensinya serta merangkumnya ke dalam Bahasa Indonesia yang formal, taktis, dan terstruktur. Pastikan tidak ada informasi penting atau keputusan rapat yang hilang karena perbedaan bahasa.",
+      "userPromptTemplate": "Analyze the following English meeting transcription and generate a comprehensive project meeting summary in Indonesian. Follow this exact structure:\n\n### RINGKASAN EKSEKUTIF\n[Tuliskan 2-3 paragraf ringkasan jalannya diskusi, keputusan penting, dan agenda utama rapat dalam Bahasa Indonesia yang formal]\n\n### DAFTAR TINDAKAN (ACTION ITEMS)\n- [Nama PIC]: [Tugas / tindakan konkret yang harus diselesaikan, ditulis dalam Bahasa Indonesia]\n- [Nama PIC]: [Tugas / tindakan konkret yang harus diselesaikan, ditulis dalam Bahasa Indonesia]\n\nMeeting Transcription:\n{{TRANSCRIPTION}}"
+    }
+  ],
+  "notes": [
+    
+  ]
+}

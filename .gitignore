@@ -12,3 +12,5 @@ google_drive_sim/
 __pycache__/
 *.pyc
 whisper-server/__pycache__/
+
+db.json
