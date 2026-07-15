@@ -128,7 +128,6 @@ async function ensureDependencies(pythonCmd: string): Promise<void> {
       "--quiet",
     ], {
       stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf-8",
     });
 
     let stderr = "";

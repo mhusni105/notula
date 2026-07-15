@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -10,6 +10,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import { Readable } from "stream";
 import { createProvider, AIProvider } from "./src/ai-provider.js";
 import { startWhisperServer, stopWhisperServer, getWhisperStatus } from "./src/whisper-local.js";
 import { createServer as createViteServer } from "vite";
@@ -166,6 +167,7 @@ if (provider) {
   addLog("success", `AI Provider "${info.provider}" berhasil diinisialisasi`, `STT: ${info.modelSTT}, LLM: ${info.modelLLM}`);
 } else {
   addLog("warning", "Tidak ada AI API Key terdeteksi. Fitur STT & LLM akan menghasilkan simulasi cerdas.");
+}
 
 // Auto-start Whisper local server if provider is whisper-local
 (async () => {
@@ -178,8 +180,6 @@ if (provider) {
     addLog("warning", "Fitur STT lokal tidak tersedia. Periksa instalasi Python dan dependensi whisper.");
   }
 })();
-
-}
 
 // Background Worker for processing transcription and summaries
 const queueProcessingActive = { value: false };
@@ -257,7 +257,7 @@ async function uploadToGoogleDrive(
       },
       media: {
         mimeType: mimeType,
-        body: fileBuffer,
+        body: Readable.from(fileBuffer),
       },
     });
 
