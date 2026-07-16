@@ -1,12 +1,17 @@
-node_modules/
+﻿node_modules/
 build/
 dist/
 coverage/
 .DS_Store
 *.log
-.env*
-!.env.example
 !.env.local
-.env.example
 .env.local
 google_drive_sim/
+
+# Whisper Local STT
+__pycache__/
+*.pyc
+whisper-server/__pycache__/
+
+db.json
+uploads/

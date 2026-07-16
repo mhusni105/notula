@@ -21,7 +21,20 @@ export interface AccountTier {
 export interface User {
   id: string;
   username: string;
+  email?: string;
   tierId: string;
+  authMethod: "local" | "google";
+  googleId?: string;
+  googleEmail?: string;
+  googleTokens?: GoogleTokens | null;
+}
+
+export interface GoogleTokens {
+  access_token: string;
+  refresh_token?: string;
+  scope?: string;
+  token_type?: string;
+  expiry_date?: number;
 }
 
 export interface NoteTemplate {
@@ -46,6 +59,7 @@ export interface Note {
   errorMessage: string | null;
   createdAt: string;
   templateId: string;
+  gdriveStorageType?: "real" | "simulated";
 }
 
 export interface ServerLog {
@@ -61,4 +75,5 @@ export interface VirtualDriveFile {
   sizeBytes: number;
   uploadedAt: string;
   contentType: string;
+  storageType: "real" | "simulated";
 }
