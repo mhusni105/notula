@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -349,20 +349,58 @@ async function processQueue() {
       if (pendingNote.status === ProcessStatus.TRANSCRIBING) {
         addLog("info", `Fase Transkripsi dimulai untuk catatan: "${pendingNote.title}"`);
         const audioFileExt = pendingNote.fileName ? getAudioFileExt(pendingNote.fileName) : "webm";
-        const driveFilePath = pendingNote.gdriveFileId ? path.join(GDRIVE_SIM_DIR, `${pendingNote.gdriveFileId}.${audioFileExt}`) : null;
+        
+        // NEW: Transcribe from LOCAL file first (uploads/ folder)
+        // File pattern: audio_{noteId}.{ext}
+        const localFilePath = path.join(UPLOADS_DIR, `audio_${pendingNote.id}.${audioFileExt}`);
 
-        if (!driveFilePath || !fs.existsSync(driveFilePath)) {
-          throw new Error("File audio tidak ditemukan di Google Drive (gdriveFileId salah atau hilang).");
+        if (!fs.existsSync(localFilePath)) {
+          throw new Error(`File audio lokal tidak ditemukan: ${localFilePath}`);
         }
 
+        addLog("info", `Menggunakan file lokal untuk transkripsi: ${localFilePath}`);
+        
+        // Start Google Drive upload in BACKGROUND (non-blocking)
+        const gdriveUploadPromise = (async () => {
+          try {
+            if (pendingNote.gdriveStorageType === "real") {
+              // Real Google Drive upload
+              const gCurrentUser = db.users.find((u) => u.id === pendingNote.userId);
+              if (gCurrentUser?.googleTokens?.access_token && googleOAuth2Client) {
+                addLog("info", "Background: Mengunggah ke Google Drive sungguhan...");
+                const mimeType = getMimeType(audioFileExt);
+                const result = await uploadToGoogleDrive(pendingNote.userId, `audio_${pendingNote.id}.${audioFileExt}`, fs.readFileSync(localFilePath), mimeType);
+                if (result.fileId) {
+                  db = readDB();
+                  db.notes = db.notes.map((n) => n.id === pendingNote.id ? { ...n, gdriveFileId: result.fileId, gdriveStorageType: "real" } : n);
+                  writeDB(db);
+                  addLog("success", "Background: Unggah ke Google Drive sungguhan selesai", "File ID: " + result.fileId);
+                }
+              }
+            } else {
+              // Simulated Google Drive: copy file to google_drive_sim/
+              const gdriveFileId = "gdrive_" + pendingNote.id;
+              const driveFilePath = path.join(GDRIVE_SIM_DIR, `${gdriveFileId}.${audioFileExt}`);
+              fs.copyFileSync(localFilePath, driveFilePath);
+              db = readDB();
+              db.notes = db.notes.map((n) => n.id === pendingNote.id ? { ...n, gdriveFileId, gdriveStorageType: "simulated" } : n);
+              writeDB(db);
+              addLog("success", "Background: Unggah ke simulasi Google Drive selesai", "File ID: " + gdriveFileId);
+            }
+          } catch (err) {
+            addLog("error", "Background: Gagal upload ke Google Drive", String(err));
+          }
+        })();
+
+        // Transcribe from local file (don't wait for GDrive upload)
         let transcriptionResult = "";
 
         if (provider) {
           try {
             const providerInfo = provider.getProviderInfo();
-            addLog("info", `Mengirimkan file audio ke ${providerInfo.provider} untuk proses transkripsi teks (STT)...`);
+            addLog("info", `Mengirimkan file audio ${localFilePath} ke ${providerInfo.provider} untuk proses transkripsi teks (STT)...`);
             const mimeType = getMimeType(audioFileExt);
-            transcriptionResult = await provider.transcribeAudio(driveFilePath, mimeType);
+            transcriptionResult = await provider.transcribeAudio(localFilePath, mimeType);
             addLog("success", `Proses transkripsi STT via ${providerInfo.provider} selesai berhasil.`);
           } catch (err: any) {
             addLog("error", `Gagal memproses STT`, String(err));
@@ -391,6 +429,15 @@ Untuk action items, Budi harap segera selesaikan modul sync offline di mobile, l
         // Apply encryption at application level before saving
         const encryptedSTT = encryptText(transcriptionResult);
         addLog("info", "Enkripsi tingkat aplikasi diterapkan pada teks transkripsi.");
+
+        // NFR-02.2: Hapus file fisik lokal SETELAH transkripsi selesai
+        if (fs.existsSync(localFilePath)) {
+          fs.unlinkSync(localFilePath);
+          addLog("success", `NFR-02.2 Clean-Up: File lokal dihapus setelah transkripsi`, `Path: ${localFilePath}`);
+        }
+
+        // Wait for Google Drive upload to complete (optional, but good for consistency)
+        await gdriveUploadPromise;
 
         db = readDB();
         db.notes = db.notes.map((n) =>
@@ -711,49 +758,28 @@ app.post("/api/notes/upload", async (req, res) => {
   try {
     addLog("info", `Memulai sinkronisasi & ingesti data untuk "${title}"...`);
 
-    // FR-02.3: Audio disimpan sementara di lokal server (atau simulasi physical stream) sebelum diupload ke Drive
+    // FR-02.3: Audio disimpan di lokal server untuk transkripsi cepat
+    // File akan dihapus SETELAH transkripsi selesai (bukan setelah upload GDrive)
     const audioBuffer = Buffer.from(audioBase64, "base64");
     fs.writeFileSync(localFilePath, audioBuffer);
-    addLog("info", `File audio tersimpan fisik di server lokal sementara`, `Path: ./uploads/${localFileName} (${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    addLog("info", `File audio tersimpan fisik di server lokal`, `Path: ./uploads/${localFileName} (${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
-    // Check if user has real Google Drive connected
+    // Google Drive upload akan dilakukan di BACKGROUND oleh worker SETELAH transkripsi
+    // Di sini kita hanya simpan metadata
+    let gdriveFileId = "";
+    let gdriveStorageType = "simulated";
+    
+    // Check if user has real Google Drive connected (untuk metadata)
     db = readDB();
     const gCurrentUser = db.users.find((u) => u.id === userId);
     const hasRealGDrive = !!(gCurrentUser?.googleTokens?.access_token);
     
-    let gdriveFileId = "";
-    let gdriveStorageType = "simulated";
-    
     if (hasRealGDrive && googleOAuth2Client) {
-      // Real Google Drive upload
-      addLog("info", "Mengunggah ke Google Drive sungguhan untuk user " + (gCurrentUser!.googleEmail || userId) + "...");
-      const mimeType = getMimeType(audioExt);
-      const result = await uploadToGoogleDrive(userId, localFileName, audioBuffer, mimeType);
-      
-      if (result.fileId) {
-        gdriveFileId = result.fileId;
-        gdriveStorageType = "real";
-        addLog("success", "Unggah ke Google Drive sungguhan berhasil!", "File ID: " + gdriveFileId);
-      } else {
-        addLog("warning", "Gagal unggah ke Google Drive sungguhan, fallback ke simulasi", result.error);
-        // Fallback to simulated
-        gdriveFileId = "gdrive_" + noteId;
-        const driveFilePath = path.join(GDRIVE_SIM_DIR, gdriveFileId + "." + audioExt);
-        fs.writeFileSync(driveFilePath, audioBuffer);
-        addLog("success", "Unggah fallback ke simulasi Google Drive berhasil.", "File ID: " + gdriveFileId);
-      }
+      gdriveStorageType = "real";
+      // gdriveFileId akan diisi oleh worker setelah upload selesai
     } else {
-      // Simulated Google Drive upload (original behavior)
+      // Simulated: generate ID sekarang, worker akan buat file nanti
       gdriveFileId = "gdrive_" + noteId;
-      const driveFilePath = path.join(GDRIVE_SIM_DIR, gdriveFileId + "." + audioExt);
-
-      addLog("info", "Mulai streaming data dari server lokal ke Google Drive Cloud Storage (SIMULASI)...");
-      fs.writeFileSync(driveFilePath, audioBuffer);
-      addLog("success", "Unggah berhasil! File terverifikasi di Google Drive Cloud Storage (SIMULASI).", "File ID: " + gdriveFileId);
-    }// NFR-02.2: Segera hapus file fisik lokal di server backend setelah verifikasi
-    if (fs.existsSync(localFilePath)) {
-      fs.unlinkSync(localFilePath);
-      addLog("success", `NFR-02.2 Clean-Up: Salinan fisik lokal di server backend telah BERHASIL DIHAPUS.`);
     }
 
     // Registrasi transaksi ke database
@@ -949,6 +975,18 @@ async function startServer() {
 }
 
 startServer();
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
